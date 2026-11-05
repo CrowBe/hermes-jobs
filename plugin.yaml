@@ -1,0 +1,27 @@
+name: hermes-jobs
+version: 0.1.0
+description: "Automation: bidirectional sync between Hermes cron (system of record) and ONE Google Calendar job board. Read-only discover/status today; sync is dry-run by default and refuses to mutate without --confirm."
+author: "Benjamin Crow (CrowBe) / Hermes Plugin Builder"
+homepage: https://github.com/CrowBe/hermes-jobs
+license: MIT
+tags: [automation, calendar, cron]
+provides_tools:
+  - hermes_jobs_discover
+requires_env:
+  - name: HERMES_JOBS_GOOGLE_CLIENT_ID
+    description: "Google Cloud OAuth Desktop client ID for hermes-jobs (calendar.events only)"
+    url: "https://console.cloud.google.com/apis/credentials"
+  - name: HERMES_JOBS_GOOGLE_CLIENT_SECRET
+    description: "Google Cloud OAuth Desktop client secret (required for confidential Desktop clients)"
+    url: "https://console.cloud.google.com/apis/credentials"
+    secret: true
+oauth:
+  - id: google
+    authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+    token_url: https://oauth2.googleapis.com/token
+    scopes:
+      - https://www.googleapis.com/auth/calendar.events
+    client_id_env: HERMES_JOBS_GOOGLE_CLIENT_ID
+    client_secret_env: HERMES_JOBS_GOOGLE_CLIENT_SECRET
+    hosts: [www.googleapis.com]
+    authorize_params: { access_type: offline, prompt: consent }
