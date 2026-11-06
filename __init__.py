@@ -1,7 +1,7 @@
 """hermes-jobs — Hermes cron (system of record) <-> ONE Google Calendar job board.
 
-Automation plugin. `discover`/`status` are read-only. `sync` is a dry-run stub that refuses to
-mutate without --confirm (and even then is not implemented in 0.1.0). Calendar event text is
+Automation plugin. `discover`/`status` are read-only. `sync` plans both directions and is a
+dry-run unless --confirm is passed on the CLI (the agent tool can only plan). Calendar event text is
 display-only: it never grants tools, permissions, or prompts.
 
 Credentials: declare oauth: in plugin.yaml; sign in with `hermes auth add hermes-jobs:google`;
@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional
+
+from . import planner
 
 SCOPE = "https://www.googleapis.com/auth/calendar.events"
-CALENDAR_NAME = "Hermes Jobs"
 AUTH_HINT = "hermes auth add hermes-jobs:google"
 
 
@@ -28,8 +29,8 @@ def _home() -> Path:
         return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 
 
-def _crons() -> list:
-    """Read jobs.json directly — never call cron.jobs.load_jobs (it creates dirs)."""
+def _raw_jobs() -> list:
+    """Read jobs.json directly -- never call cron.jobs.load_jobs (it creates dirs)."""
     f = _home() / "cron" / "jobs.json"
     if not f.exists():
         return []
@@ -38,16 +39,64 @@ def _crons() -> list:
     except Exception:
         return []
     jobs = data.get("jobs", data) if isinstance(data, dict) else data
+    return [j for j in jobs if isinstance(j, dict) and j.get("id")]
+
+
+def _next_start(j: dict) -> Optional[str]:
+    """Stored next_run_at, else the next slot of the schedule (paused jobs keep a slot on the board)."""
+    if j.get("next_run_at"):
+        return j["next_run_at"]
+    sched = j.get("schedule") or {}
+    if sched.get("kind") != "cron":
+        return None
+    try:
+        from croniter import croniter
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(j["timezone"])) if j.get("timezone") else datetime.now().astimezone()
+        return croniter(sched["expr"], now).get_next(datetime).isoformat()
+    except Exception:
+        return None
+
+
+def _crons() -> list:
+    """Read-only job view for the planner. Prompt stays local; only its digest reaches the calendar."""
     return [
         {
-            "id": j.get("id"),
+            "id": j["id"],
             "name": j.get("name"),
-            "schedule": j.get("schedule_display") or j.get("schedule"),
-            "enabled": j.get("enabled", True),
+            "prompt": j.get("prompt") or "",
+            "schedule": j.get("schedule_display") or (j.get("schedule") or {}).get("display") or j.get("schedule"),
+            "enabled": j.get("enabled", True) and j.get("state") != "paused",
+            "start": _next_start(j),
         }
-        for j in jobs
-        if isinstance(j, dict)
+        for j in _raw_jobs()
     ]
+
+
+def _state_file() -> Path:
+    try:
+        from hermes_cli.plugins_state import PluginState
+        d = PluginState("hermes-jobs").data_dir
+    except Exception:
+        d = _home() / "plugin-data" / "hermes-jobs"
+    return d / "sync-state.json"
+
+
+def _load_state() -> Dict[str, Any]:
+    f = _state_file()
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return {"calendar_id": None, "jobs": {}}
+
+
+def _save_state(state: Dict[str, Any]) -> None:
+    f = _state_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(f)
 
 
 def _oauth_status() -> Dict[str, Any]:
@@ -74,118 +123,149 @@ def _oauth_status() -> Dict[str, Any]:
     }
 
 
-def _calendars() -> Union[List[Dict[str, Any]], Dict[str, Any], str]:
-    """List calendars through Hermes credentialed_provider_request only."""
-    try:
-        from hermes_cli.auth_constants import AuthError
-        from hermes_cli.plugin_provider_requests import (
-            ProviderNotSignedIn,
-            credentialed_provider_request,
-        )
-    except ImportError:
-        return {
-            "skipped": True,
-            "reason": "credentialed_provider_request unavailable on this Hermes",
-            "sign_in": AUTH_HINT,
-        }
+CRON_FIELDS = {"schedule", "name"}  # the only cron fields calendar edits may touch
+_CTX: Dict[str, Any] = {}
 
-    try:
-        resp = credentialed_provider_request(
-            "google",
-            "GET",
-            "https://www.googleapis.com/calendar/v3/users/me/calendarList",
-            timeout=20,
-        )
-    except ProviderNotSignedIn as exc:
-        return {"signed_in": False, "error": str(exc), "sign_in": AUTH_HINT}
-    except AuthError as exc:
-        code = getattr(exc, "code", "auth_error")
-        return {"signed_in": False, "error": f"{code}: {exc}", "sign_in": AUTH_HINT}
-    except PermissionError as exc:
-        return {"signed_in": False, "error": str(exc), "sign_in": AUTH_HINT}
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"{type(exc).__name__}: {exc}", "sign_in": AUTH_HINT}
 
-    if getattr(resp, "status", 500) >= 300:
-        body = getattr(resp, "text", "") or ""
-        return {"ok": False, "status": resp.status, "body": body[:300], "sign_in": AUTH_HINT}
-
-    try:
-        items = resp.json().get("items", [])
-    except Exception:
-        items = []
-    return [
-        {
-            "id": c.get("id"),
-            "summary": c.get("summary"),
-            "is_job_board": c.get("summary") == CALENDAR_NAME,
-        }
-        for c in items
-        if isinstance(c, dict)
-    ]
+def _events(calendar_id: Optional[str], offline: bool) -> List[Dict[str, Any]]:
+    if offline or not calendar_id:
+        return []
+    from .gcal import Calendar
+    return Calendar(calendar_id).list_tagged()
 
 
 def discover() -> Dict[str, Any]:
-    crons = _crons()
-    oauth = _oauth_status()
-    cals = _calendars()
+    st = _load_state()
     return {
         "dry_run": True,
         "writes": 0,
-        "cron_count": len(crons),
-        "crons": crons,
-        "oauth": oauth,
-        "calendars": cals,
-        "target_calendar": CALENDAR_NAME,
+        "crons": [{k: c[k] for k in ("id", "name", "schedule", "enabled", "start")} for c in _crons()],
+        "oauth": _oauth_status(),
+        "calendar_id": st.get("calendar_id"),
+        "state_file": str(_state_file()),
         "note": "Never uses google_token.json; credentials only via Hermes oauth + hermes auth.",
     }
 
 
 def status() -> Dict[str, Any]:
-    d = discover()
-    cals = d["calendars"]
-    job_board = isinstance(cals, list) and any(c.get("is_job_board") for c in cals)
+    st = _load_state()
     return {
-        "cron_count": d["cron_count"],
-        "oauth_helpers_available": d["oauth"].get("helpers_available"),
-        "job_board_found": job_board,
+        "cron_count": len(_raw_jobs()),
+        "oauth_helpers_available": _oauth_status().get("helpers_available"),
+        "calendar_id": st.get("calendar_id"),
+        "synced_jobs": len(st.get("jobs", {})),
         "sign_in": AUTH_HINT,
-        "sync": "not implemented (0.1.0 scaffold)",
     }
 
 
-def sync(confirm: bool = False) -> Dict[str, Any]:
-    if not confirm:
-        return {"dry_run": True, "plan": "cron -> calendar diff (not yet implemented)", "writes": 0}
-    return {"refused": True, "reason": "sync mutation not implemented in 0.1.0", "writes": 0}
+def bind(calendar_id: str) -> Dict[str, Any]:
+    """Choose the ONE calendar to sync (local state only). Rebinding forgets prior event links."""
+    st = _load_state()
+    if st.get("calendar_id") != calendar_id:
+        st = {"calendar_id": calendar_id, "jobs": {}}
+        _save_state(st)
+    return {"calendar_id": calendar_id, "state_file": str(_state_file())}
+
+
+def sync(confirm: bool = False, offline: bool = False) -> Dict[str, Any]:
+    st = _load_state()
+    cal = st.get("calendar_id")
+    if confirm and (offline or not cal):
+        return {"refused": True, "reason": "--confirm needs a bound calendar and no --offline", "writes": 0}
+    try:
+        jobs, events = _crons(), _events(cal, offline)
+    except Exception as exc:  # noqa: BLE001 -- not signed in, HTTP error, ...
+        return {"error": f"{type(exc).__name__}: {exc}", "sign_in": AUTH_HINT, "writes": 0}
+    ops = planner.plan(jobs, events, st.get("jobs", {}))
+    out: Dict[str, Any] = {"dry_run": not confirm, "calendar_id": cal, "offline": offline or not cal,
+                           "events_seen": len(events), "ops": ops, "writes": 0}
+    if confirm:
+        out["writes"], out["errors"] = _apply(ops, cal)
+        _snapshot(cal)
+    return out
+
+
+def _apply(ops: List[Dict[str, Any]], calendar_id: str):
+    from .gcal import Calendar
+    cron = _CTX["ctx"].dispatch_tool  # public seam: Hermes' own cronjob_manage tool
+    gc, writes, errors = Calendar(calendar_id), 0, []
+    for op in ops:
+        a, jid = op["action"], op["job_id"]
+        try:
+            if a == "insert_event":
+                gc.insert(op["event"])
+            elif a == "patch_event":
+                gc.patch(op["event_id"], op["event"])
+            elif a == "delete_event":
+                gc.delete(op["event_id"])
+            elif a == "update_job":
+                upd = {k: v for k, v in op["updates"].items() if k in CRON_FIELDS}
+                _check(cron("cronjob_manage", {"action": "update", "job_id": jid, **upd}))
+            elif a == "pause_job":
+                _check(cron("cronjob_manage", {"action": "pause", "job_id": jid,
+                                               "reason": "hermes-jobs: calendar event deleted"}))
+            else:
+                continue
+            writes += 1
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"op": op, "error": f"{type(exc).__name__}: {exc}"})
+    return writes, errors
+
+
+def _check(result: str) -> None:
+    try:
+        data = json.loads(result)
+    except Exception:
+        return
+    if isinstance(data, dict) and (data.get("error") or data.get("success") is False):
+        raise RuntimeError(str(data.get("error") or data)[:200])
+
+
+def _snapshot(calendar_id: str) -> None:
+    """Record what is now on both sides so the next run can tell who moved what."""
+    jobs = {j["id"]: j for j in _crons()}
+    st = {"calendar_id": calendar_id, "jobs": {}}
+    for ev in _events(calendar_id, False):
+        j = jobs.get(ev["hermes_job_id"])
+        if j:
+            st["jobs"][j["id"]] = {"event_id": ev["id"], "job_hash": planner.job_hash(j),
+                                   "start": ev["start"], "summary": ev["summary"]}
+    _save_state(st)
 
 
 def _cli(args) -> None:
-    fn = {
-        "discover": discover,
-        "status": status,
-        "sync": lambda: sync(getattr(args, "confirm", False)),
-    }[args.jobs_cmd or "status"]
-    print(json.dumps(fn(), indent=2, default=str))
+    cmd = args.jobs_cmd or "status"
+    if cmd == "bind":
+        res = bind(args.calendar)
+    elif cmd == "sync":
+        res = sync(args.confirm, args.offline)
+    else:
+        res = {"discover": discover, "status": status}[cmd]()
+    print(json.dumps(res, indent=2, default=str))
 
 
 def _setup(p) -> None:
     sub = p.add_subparsers(dest="jobs_cmd")
-    sub.add_parser("discover", help="Read-only: crons, Hermes oauth status, calendars")
+    sub.add_parser("discover", help="Read-only: crons, Hermes oauth status, bound calendar")
     sub.add_parser("status", help="One-line health summary")
-    s = sub.add_parser("sync", help="Dry-run by default; --confirm still refused in 0.1.0")
-    s.add_argument("--confirm", action="store_true")
+    b = sub.add_parser("bind", help="Choose the ONE calendar to sync (e.g. primary)")
+    b.add_argument("calendar")
+    s = sub.add_parser("sync", help="Plan both directions; dry-run unless --confirm")
+    s.add_argument("--confirm", action="store_true", help="Apply the plan (cron + calendar writes)")
+    s.add_argument("--offline", action="store_true", help="Plan against an empty calendar; no Google calls")
 
 
 def _tool(args: Dict[str, Any], **_: Any) -> str:
     action = (args or {}).get("action", "status")
-    return json.dumps(discover() if action == "discover" else status(), default=str)
+    fn = {"discover": discover, "plan": lambda: sync(confirm=False)}.get(action, status)
+    return json.dumps(fn(), default=str)
 
 
 def register(ctx) -> None:
+    _CTX["ctx"] = ctx
     ctx.register_cli_command(
         name="hermes-jobs",
-        help="Cron <-> Google Calendar job board (read-only; Hermes oauth)",
+        help="Cron <-> Google Calendar job board (dry-run by default; Hermes oauth)",
         setup_fn=_setup,
         handler_fn=_cli,
     )
@@ -194,19 +274,19 @@ def register(ctx) -> None:
         toolset="hermes-jobs",
         handler=_tool,
         description=(
-            "Read-only: report Hermes crons and job-board calendar sync readiness "
-            "via Hermes oauth (never google_token.json)."
+            "Read-only: report Hermes crons, sync readiness, or the dry-run sync plan "
+            "via Hermes oauth (never google_token.json). Never writes."
         ),
         schema={
             "name": "hermes_jobs_discover",
             "description": (
-                "Read-only report of Hermes crons and Google Calendar job-board readiness. "
-                "Never mutates. Uses Hermes credentialed_provider_request when available."
+                "Read-only report of Hermes crons and the Google Calendar job board, or the dry-run "
+                "sync plan. Never mutates; applying a plan is a human CLI step (--confirm)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["discover", "status"]},
+                    "action": {"type": "string", "enum": ["discover", "status", "plan"]},
                 },
             },
         },
