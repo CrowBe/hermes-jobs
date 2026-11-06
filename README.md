@@ -39,3 +39,20 @@ hermes hermes-jobs sync       # dry-run (0.1.0: plan only)
 ## Repo
 
 https://github.com/CrowBe/hermes-jobs
+
+## Sync (0.2.0)
+
+```
+hermes hermes-jobs bind primary          # choose the ONE calendar (local state only)
+hermes hermes-jobs sync --offline        # dry-run against an empty calendar, no Google calls
+hermes hermes-jobs sync                  # dry-run against the bound calendar
+hermes hermes-jobs sync --confirm        # apply (human CLI step only; the agent tool can only plan)
+```
+
+- cron -> calendar: one 15-min event per job at its next run, tagged `extendedProperties.private.hermes_job_id`;
+  title = job name (`[paused] ` prefix when paused); description = job id + prompt sha256 digest only.
+- calendar -> cron (tagged events only, via Hermes' `cronjob_manage`): move -> schedule time update,
+  retitle -> name update, delete -> pause (reversible). Untagged events are ignored; event text never
+  grants tools or edits prompts.
+- Conflicts: a cron edit wins and resets the event; otherwise a human move wins until the next cron edit.
+- Tests: `python -m unittest discover -s tests`.

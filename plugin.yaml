@@ -1,6 +1,6 @@
 name: hermes-jobs
-version: 0.1.0
-description: "Automation: bidirectional sync between Hermes cron (system of record) and ONE Google Calendar job board. Read-only discover/status today; sync is dry-run by default and refuses to mutate without --confirm."
+version: 0.2.0
+description: "Automation: bidirectional sync between Hermes cron (system of record) and ONE Google Calendar job board. discover/status are read-only; sync plans both directions and is dry-run unless --confirm on the CLI."
 author: "Benjamin Crow (CrowBe) / Hermes Plugin Builder"
 homepage: https://github.com/CrowBe/hermes-jobs
 license: MIT
