@@ -11,7 +11,7 @@ T9, T10, T11 = "2026-11-07T09:00:00+11:00", "2026-11-07T10:00:00+11:00", "2026-1
 
 def job(**kw):
     return {"id": "j1", "name": "Daily brief", "prompt": "summarise", "schedule": "0 9 * * *",
-            "enabled": True, "start": T9, **kw}
+            "enabled": True, "start": T9, "schedule_kind": "cron", "next_after": T11, **kw}
 
 
 def ev(**kw):
@@ -45,15 +45,18 @@ class PlannerTest(unittest.TestCase):
     def test_in_sync_is_noop(self):
         self.assertEqual(P.plan([job()], [ev()], synced()), [])
 
-    def test_human_move_wins(self):
+    def test_human_move_creates_one_shot_not_schedule_rewrite(self):
         ops = P.plan([job()], [ev(start=T10)], synced())
-        self.assertEqual(actions(ops), [("calendar->cron", "update_job")])
-        self.assertEqual(ops[0]["updates"], {"schedule": "0 10 * * *"})
+        self.assertEqual(actions(ops), [("calendar->cron", "create_once")])
+        self.assertEqual(ops[0]["create_args"]["schedule"], T10)
+        self.assertEqual(ops[0]["create_args"]["repeat"], 1)
+        self.assertEqual(ops[0]["board_start"], T11)
+        self.assertIn("original occurrence WILL still run", ops[0]["warning"])
 
-    def test_interval_move_stays_on_calendar(self):
+    def test_interval_move_also_copies_once(self):
         j = job(schedule="every 2h")
         ops = P.plan([j], [ev(start=T10)], synced(j))
-        self.assertEqual(actions(ops), [("state", "record")])
+        self.assertEqual(actions(ops), [("calendar->cron", "create_once")])
 
     def test_cron_edit_resets_moved_event(self):
         edited = job(prompt="new prompt")
@@ -101,6 +104,62 @@ class PlannerTest(unittest.TestCase):
 
     def test_job_without_next_run_gets_no_event(self):
         self.assertEqual(P.plan([job(start=None)], [], {}), [])
+
+    def test_delete_pause_explains_exact_resume(self):
+        op = P.plan([job()], [], synced())[0]
+        self.assertEqual(op["resume_command"], "hermes cron resume j1")
+        self.assertIn("job j1 paused because its calendar event was deleted", op["reason"])
+
+    def test_paused_by_delete_does_not_recreate(self):
+        ops = P.plan([job(enabled=False)], [], synced(paused_by_delete=True, event_id=None))
+        self.assertEqual(actions(ops), [("report", "notice")])
+        self.assertIn("hermes cron resume j1", ops[0]["reason"])
+
+    def test_resume_recreates(self):
+        ops = P.plan([job()], [], synced(paused_by_delete=True, event_id=None))
+        self.assertEqual(actions(ops), [("cron->calendar", "insert_event")])
+
+    def test_delete_already_paused_keeps_reason(self):
+        self.assertEqual(P.plan([job(enabled=False)], [], synced())[0]["action"], "pause_job")
+
+    def test_copy_carries_source_configuration_not_event_text(self):
+        args = {"prompt": "trusted", "deliver": "local", "skills": ["brief"], "enabled_toolsets": []}
+        ops = P.plan([job(copy_args=args)], [ev(start=T10, description="untrusted")], synced())
+        self.assertEqual(ops[0]["create_args"]["prompt"], "trusted")
+        self.assertEqual(ops[0]["create_args"]["enabled_toolsets"], [])
+        self.assertEqual(ops[0]["create_args"]["name"], "Daily brief (moved 2026-11-07)")
+
+    def test_copy_refuses_uncopyable_execution_settings(self):
+        ops = P.plan([job(copy_error="pinned model")], [ev(start=T10)], synced())
+        self.assertEqual(ops[0]["action"], "notice")
+
+    def test_pending_move_retries_without_creating_duplicate(self):
+        ops = P.plan([job()], [ev(start=T10)], synced(pending_move={"child_id": "c"}))
+        self.assertEqual(ops[0]["action"], "finish_move")
+
+    def test_uncertain_create_blocks_retry(self):
+        ops = P.plan([job()], [ev(start=T10)], synced(move_intent="e1"))
+        self.assertEqual(ops[0]["action"], "notice")
+
+    def test_source_board_previews_following_slot(self):
+        ops = P.plan([job()], [], synced(event_id=None, original_slot=T9, board_start=T11))
+        self.assertEqual(ops[0]["event"]["start"], T11)
+
+    def test_source_preview_does_not_rewind_before_original_runs(self):
+        self.assertEqual(P.plan([job()], [ev(start=T11)], synced(start=T11, original_slot=T9, board_start=T11)), [])
+
+    def test_finished_copy_event_cleanup(self):
+        ops = P.plan([job(terminal=True)], [ev()], synced(source_job_id="source"))
+        self.assertEqual(ops[0]["action"], "delete_event")
+        self.assertEqual(P.plan([job(terminal=True)], [], synced(source_job_id="source")), [])
+
+    def test_deleted_copy_pauses_and_retains_source_link(self):
+        ops = P.plan([job(schedule_kind="once")], [], synced(source_job_id="source"))
+        self.assertEqual(ops[0]["action"], "pause_job")
+
+    def test_existing_one_shot_move_updates_only_that_once(self):
+        ops = P.plan([job(schedule_kind="once")], [ev(start=T10)], synced())
+        self.assertEqual(ops[0]["updates"], {"schedule": T10})
 
 
 if __name__ == "__main__":

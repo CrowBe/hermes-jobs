@@ -36,42 +36,108 @@ def _raw_jobs() -> list:
         return []
     try:
         data = json.loads(f.read_text(encoding="utf-8"))
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError("cannot read cron store safely; sync aborted") from exc
     jobs = data.get("jobs", data) if isinstance(data, dict) else data
     return [j for j in jobs if isinstance(j, dict) and j.get("id")]
 
 
-def _next_start(j: dict) -> Optional[str]:
-    """Stored next_run_at, else the next slot of the schedule (paused jobs keep a slot on the board)."""
-    if j.get("next_run_at"):
-        return j["next_run_at"]
-    sched = j.get("schedule") or {}
+def _job_zone(raw: dict):
+    """Only public config reader + stdlib; no private cron imports or credential reads."""
+    import os
+    from zoneinfo import ZoneInfo
+    from hermes_cli.config import load_config_readonly
+    name = raw.get("timezone") or os.environ.get("HERMES_TIMEZONE") or load_config_readonly().get("timezone")
+    if not name:
+        target = str(Path("/etc/localtime").resolve())
+        if "/zoneinfo/" in target:
+            name = target.split("/zoneinfo/", 1)[1]
+    if not name:
+        raise ValueError("no IANA timezone available; pin the source job timezone before moving")
+    return ZoneInfo(name)
+
+
+def _following_start(raw: dict, start: Optional[str] = None) -> Optional[str]:
+    """Read-only recurrence calculation, following installed Hermes' wall-clock/DST rules."""
+    from datetime import datetime, timedelta, timezone
+    sched = raw.get("schedule") or {}
+    zone = _job_zone(raw)
+    base = datetime.fromisoformat(start.replace("Z", "+00:00")) if start else datetime.now(zone)
+    if sched.get("kind") == "interval":
+        return (base.astimezone(timezone.utc) + timedelta(minutes=sched["minutes"])).astimezone(zone).isoformat()
     if sched.get("kind") != "cron":
         return None
+    from croniter import croniter
+    it = croniter(sched["expr"], base.astimezone(zone).replace(tzinfo=None))
+    for _ in range(2):
+        wall = it.get_next(datetime)
+        for fold in (0, 1):
+            candidate = wall.replace(tzinfo=zone, fold=fold)
+            if candidate.timestamp() > base.timestamp():
+                return candidate.isoformat()
+    raise ValueError("cannot resolve next slot across DST")
+
+
+def _next_start(j: dict) -> Optional[str]:
+    """Stored next run; paused recurring jobs keep a read-only board preview."""
+    if j.get("next_run_at"):
+        return j["next_run_at"]
+    if (j.get("schedule") or {}).get("kind") != "cron":
+        return None
     try:
-        from croniter import croniter
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        now = datetime.now(ZoneInfo(j["timezone"])) if j.get("timezone") else datetime.now().astimezone()
-        return croniter(sched["expr"], now).get_next(datetime).isoformat()
+        return _following_start(j)
     except Exception:
         return None
 
 
+# Verified against installed tools/cronjob_tools.py:_HANDLER_FORWARDED_ARGS.
+COPY_FIELDS = {"prompt", "deliver", "failure_deliver", "skills", "script", "context_from",
+               "enabled_toolsets", "workdir", "no_agent", "attach_to_session", "timezone", "catch_up"}
+
+
+def _copy_args(raw: dict) -> dict:
+    args = {k: raw[k] for k in COPY_FIELDS if raw.get(k) is not None}
+    args.setdefault("deliver", "local")
+    if raw.get("skill") and not args.get("skills"):
+        args["skills"] = [raw["skill"]]
+    refs = args.get("context_from")
+    if refs:
+        args["context_from"] = [raw["id"] if r == "self" else r for r in ([refs] if isinstance(refs, str) else refs)]
+    for key in ("deliver", "failure_deliver"):
+        if "origin" in str(args.get(key, "")).split(","):
+            origin = raw.get("origin") or {}
+            target = ":".join(str(origin[k]) for k in ("platform", "chat_id", "thread_id") if origin.get(k))
+            if not target or not origin.get("chat_id"):
+                raise ValueError("origin delivery cannot be safely copied; set an explicit delivery target first")
+            args[key] = ",".join(target if t == "origin" else t for t in args[key].split(","))
+    for key in ("monitor_script", "monitor_url"):
+        if raw.get(key):
+            args[key] = raw[key]  # explicit legacy args accepted by _cronjob_handler
+    # Dispatch deliberately drops these fields. Refuse rather than silently changing execution.
+    if any(raw.get(k) for k in ("model", "provider", "base_url", "reasoning_effort", "interpreter")):
+        raise ValueError("source has inference/interpreter settings cronjob_manage cannot copy; move refused")
+    return args
+
+
 def _crons() -> list:
-    """Read-only job view for the planner. Prompt stays local; only its digest reaches the calendar."""
-    return [
-        {
-            "id": j["id"],
-            "name": j.get("name"),
-            "prompt": j.get("prompt") or "",
-            "schedule": j.get("schedule_display") or (j.get("schedule") or {}).get("display") or j.get("schedule"),
-            "enabled": j.get("enabled", True) and j.get("state") != "paused",
-            "start": _next_start(j),
-        }
-        for j in _raw_jobs()
-    ]
+    """Read-only view. No scheduler writes; prompts never flow to Calendar."""
+    out = []
+    for raw in _raw_jobs():
+        sched = raw.get("schedule") or {}
+        start = _next_start(raw)
+        j = {"id": raw["id"], "name": raw.get("name"), "prompt": raw.get("prompt") or "",
+             "schedule": raw.get("schedule_display") or sched.get("display") or sched,
+             "schedule_kind": sched.get("kind"), "enabled": raw.get("enabled", True) and raw.get("state") != "paused",
+             "terminal": raw.get("state") in {"completed", "error"}, "start": start}
+        try:
+            j["copy_args"] = _copy_args(raw)
+            if start and sched.get("kind") in {"cron", "interval"}:
+                # Mirror Hermes wall-clock/DST calculation without importing private cron internals.
+                j["next_after"] = _following_start(raw, start)
+        except (ValueError, KeyError, TypeError) as exc:
+            j["copy_error"] = str(exc)
+        out.append(j)
+    return out
 
 
 def _state_file() -> Path:
@@ -155,6 +221,7 @@ def status() -> Dict[str, Any]:
         "calendar_id": st.get("calendar_id"),
         "synced_jobs": len(st.get("jobs", {})),
         "sign_in": AUTH_HINT,
+        "messages": [planner.pause_message(jid) for jid, last in st.get("jobs", {}).items() if last.get("paused_by_delete")],
     }
 
 
@@ -167,7 +234,7 @@ def bind(calendar_id: str) -> Dict[str, Any]:
     return {"calendar_id": calendar_id, "state_file": str(_state_file())}
 
 
-def sync(confirm: bool = False, offline: bool = False) -> Dict[str, Any]:
+def sync(confirm: bool = False, offline: bool = False, allow_additional_run: bool = False) -> Dict[str, Any]:
     st = _load_state()
     cal = st.get("calendar_id")
     if confirm and (offline or not cal):
@@ -176,12 +243,19 @@ def sync(confirm: bool = False, offline: bool = False) -> Dict[str, Any]:
         jobs, events = _crons(), _events(cal, offline)
     except Exception as exc:  # noqa: BLE001 -- not signed in, HTTP error, ...
         return {"error": f"{type(exc).__name__}: {exc}", "sign_in": AUTH_HINT, "writes": 0}
-    ops = planner.plan(jobs, events, st.get("jobs", {}))
+    ops = planner.plan(jobs, events, {} if offline else st.get("jobs", {}))
     out: Dict[str, Any] = {"dry_run": not confirm, "calendar_id": cal, "offline": offline or not cal,
-                           "events_seen": len(events), "ops": ops, "writes": 0}
+                           "events_seen": len(events), "ops": ops, "writes": 0,
+                           "messages": [o["reason"] for o in ops if o["action"] in {"pause_job", "notice"}],
+                           "warnings": [o["warning"] for o in ops if o.get("warning")]}
+    if confirm and any(o["action"] == "create_once" for o in ops) and not allow_additional_run:
+        out.update(refused=True, reason="Exact occurrence suppression is unavailable. Review the duplicate-run warning, then explicitly use --confirm --allow-additional-run to create an additional run.")
+        return out
     if confirm:
         out["writes"], out["errors"] = _apply(ops, cal)
-        _snapshot(cal)
+        # Do not bless failed operations as a successful baseline.
+        if not out["errors"]:
+            _snapshot(cal)
     return out
 
 
@@ -189,21 +263,63 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str):
     from .gcal import Calendar
     cron = _CTX["ctx"].dispatch_tool  # public seam: Hermes' own cronjob_manage tool
     gc, writes, errors = Calendar(calendar_id), 0, []
+    st = _load_state()
+    links = st.setdefault("jobs", {})
     for op in ops:
         a, jid = op["action"], op["job_id"]
         try:
             if a == "insert_event":
-                gc.insert(op["event"])
+                ev = gc.insert(op["event"])
+                links.setdefault(jid, {}).pop("paused_by_delete", None)
+                links[jid].update(event_id=ev["id"], job_hash=planner.job_hash(next(j for j in _crons() if j["id"] == jid)),
+                                  start=ev["start"], summary=ev["summary"])
+                _save_state(st)
             elif a == "patch_event":
                 gc.patch(op["event_id"], op["event"])
             elif a == "delete_event":
                 gc.delete(op["event_id"])
+                if jid in links:
+                    links[jid]["event_id"] = None
+                    _save_state(st)
             elif a == "update_job":
                 upd = {k: v for k, v in op["updates"].items() if k in CRON_FIELDS}
                 _check(cron("cronjob_manage", {"action": "update", "job_id": jid, **upd}))
             elif a == "pause_job":
                 _check(cron("cronjob_manage", {"action": "pause", "job_id": jid,
                                                "reason": "hermes-jobs: calendar event deleted"}))
+                links.setdefault(jid, {}).update(paused_by_delete=True, event_id=None,
+                                                 pause_reason=planner.pause_message(jid))
+                _save_state(st)
+            elif a in {"create_once", "finish_move"}:
+                if a == "create_once":
+                    # Journal intent before creating: a crash with unknown result must not duplicate.
+                    links.setdefault(jid, {})["move_intent"] = op["event_id"]
+                    _save_state(st)
+                    result = _check(cron("cronjob_manage", {"action": "create", **op["create_args"]}))
+                    writes += 1  # cron creation and event ownership patch are separate writes
+                    child = result.get("job_id")
+                    if not child:
+                        raise RuntimeError("create returned no job_id; reconcile move_intent manually before retry")
+                    links[child] = {"source_job_id": jid, "event_id": op["event_id"],
+                                    "original_slot": op["original_slot"]}
+                    links[jid].update(pending_move={"child_id": child, "event_id": op["event_id"],
+                                                   "moved_start": op["moved_start"],
+                                                   "original_slot": op["original_slot"], "board_start": op["board_start"]})
+                    links[jid].pop("move_intent", None)
+                    _save_state(st)
+                pending = links[jid]["pending_move"]
+                child = pending["child_id"]
+                child_job = next(j for j in _crons() if j["id"] == child)
+                body = planner.event_body(child_job)
+                body["start"] = pending["moved_start"]
+                gc.patch(pending["event_id"], body)
+                links[child].update(job_hash=planner.job_hash(child_job), start=body["start"], summary=body["summary"])
+                links[jid].update(original_slot=pending["original_slot"], board_start=pending["board_start"], event_id=None)
+                links[jid].pop("pending_move", None)
+                _save_state(st)
+            elif a == "forget":
+                links.pop(jid, None)
+                _save_state(st)
             else:
                 continue
             writes += 1
@@ -212,24 +328,29 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str):
     return writes, errors
 
 
-def _check(result: str) -> None:
-    try:
-        data = json.loads(result)
-    except Exception:
-        return
-    if isinstance(data, dict) and (data.get("error") or data.get("success") is False):
+def _check(result) -> dict:
+    data = json.loads(result) if isinstance(result, str) else result
+    if not isinstance(data, dict):
+        raise RuntimeError("cronjob_manage returned no structured result")
+    if data.get("error") or data.get("success") is False:
         raise RuntimeError(str(data.get("error") or data)[:200])
+    return data
 
 
 def _snapshot(calendar_id: str) -> None:
     """Record what is now on both sides so the next run can tell who moved what."""
     jobs = {j["id"]: j for j in _crons()}
-    st = {"calendar_id": calendar_id, "jobs": {}}
+    old = _load_state().get("jobs", {})
+    st = {"calendar_id": calendar_id, "jobs": {jid: dict(last) for jid, last in old.items() if jid in jobs}}
+    for jid, last in st["jobs"].items():
+        if last.get("original_slot") and jobs[jid].get("start") != last["original_slot"]:
+            last.pop("original_slot", None)
+            last.pop("board_start", None)
     for ev in _events(calendar_id, False):
         j = jobs.get(ev["hermes_job_id"])
         if j:
-            st["jobs"][j["id"]] = {"event_id": ev["id"], "job_hash": planner.job_hash(j),
-                                   "start": ev["start"], "summary": ev["summary"]}
+            st["jobs"].setdefault(j["id"], {}).update(event_id=ev["id"], job_hash=planner.job_hash(j),
+                                                        start=ev["start"], summary=ev["summary"])
     _save_state(st)
 
 
@@ -238,7 +359,7 @@ def _cli(args) -> None:
     if cmd == "bind":
         res = bind(args.calendar)
     elif cmd == "sync":
-        res = sync(args.confirm, args.offline)
+        res = sync(args.confirm, args.offline, args.allow_additional_run)
     else:
         res = {"discover": discover, "status": status}[cmd]()
     print(json.dumps(res, indent=2, default=str))
@@ -252,6 +373,7 @@ def _setup(p) -> None:
     b.add_argument("calendar")
     s = sub.add_parser("sync", help="Plan both directions; dry-run unless --confirm")
     s.add_argument("--confirm", action="store_true", help="Apply the plan (cron + calendar writes)")
+    s.add_argument("--allow-additional-run", action="store_true", help="Accept that a moved recurring occurrence ALSO runs at its original slot (requires --confirm)")
     s.add_argument("--offline", action="store_true", help="Plan against an empty calendar; no Google calls")
 
 

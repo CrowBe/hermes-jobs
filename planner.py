@@ -3,8 +3,9 @@
 Rules: cron is the system of record. Only events tagged with a hermes job id are considered;
 untagged events are ignored and never become jobs. Event text is never parsed for tools,
 permissions, or prompts -- only start time and title flow back, as schedule metadata.
-Conflicts: a cron edit (name/prompt/schedule/enabled) wins and resets the event; otherwise a
-human-moved start wins (cron next_run_at follows it) until the next cron edit.
+Conflicts: cron edits win. A moved recurring occurrence creates a one-shot copy; it never
+rewrites the recurring schedule. Hermes has no public skip-occurrence API: duplicate-run
+warnings are part of the plan, not a promise of suppression.
 """
 from __future__ import annotations
 
@@ -64,15 +65,38 @@ def plan(jobs: List[Dict[str, Any]], events: List[Dict[str, Any]], state: Dict[s
     for jid in state.keys() - by_id.keys() - tagged.keys():
         ops.append(_op("state", "forget", jid, "job and event both gone"))
 
+    pending_children = {last["pending_move"].get("child_id") for last in state.values() if last.get("pending_move")}
     for jid, job in by_id.items():
+        if jid in pending_children:
+            continue  # parent owns transfer recovery; absence is not a human deletion
         ev, last, h = tagged.get(jid), state.get(jid), job_hash(job)
+        last = last or {}
         body = event_body(job)
+        # A copied occurrence has its own lifecycle. Completed/removed copies never respawn.
+        if last.get("source_job_id") and job.get("terminal"):
+            if ev:
+                ops.append(_op("cron->calendar", "delete_event", jid, "one-shot finished; retain cron history", event_id=ev["id"]))
+            continue
+        if last.get("move_intent"):
+            ops.append(_op("report", "notice", jid, "uncertain one-shot create result: reconcile move_intent in sync state before retry; no duplicate created"))
+            continue
+        if last.get("pending_move"):
+            ops.append(_op("calendar->cron", "finish_move", jid, "retry event ownership transfer; no new copy",
+                           **last["pending_move"]))
+            continue
+        # Show the next repeating slot while the original (unsuppressed) slot is outstanding.
+        if last.get("original_slot") == job.get("start") and last.get("board_start"):
+            body["start"] = last["board_start"]
         if ev is None:
-            if last and last.get("event_id"):
-                ops.append(_op("calendar->cron", "pause_job", jid, "hermes-owned event deleted on calendar")
-                           if job.get("enabled", True) else
-                           _op("state", "forget", jid, "event deleted; job already paused"))
-            elif job.get("start"):
+            if last.get("paused_by_delete"):
+                if job.get("enabled", True) and job.get("start"):
+                    ops.append(_op("cron->calendar", "insert_event", jid, "job resumed in Hermes; recreate event", event=body))
+                else:
+                    ops.append(_op("report", "notice", jid, pause_message(jid)))
+            elif last.get("event_id"):
+                ops.append(_op("calendar->cron", "pause_job", jid, pause_message(jid),
+                               resume_command=resume_command(jid)))
+            elif job.get("start") and not job.get("terminal"):
                 ops.append(_op("cron->calendar", "insert_event", jid, "job has no event yet", event=body))
             continue
         if not last or last.get("job_hash") != h:
@@ -87,11 +111,22 @@ def plan(jobs: List[Dict[str, Any]], events: List[Dict[str, Any]], state: Dict[s
         retitled = ev.get("summary") != last.get("summary")
         if moved:
             if job.get("enabled", True):
-                upd = moved_schedule(job.get("schedule"), ev["start"])
-                ops.append(_op("calendar->cron", "update_job", jid, "event moved by human: calendar start wins",
-                               updates={"schedule": upd}) if upd else
-                           _op("state", "record", jid, "event moved but schedule kind can't follow; kept on calendar",
-                               event_id=ev["id"]))
+                if job.get("schedule_kind") == "once":
+                    ops.append(_op("calendar->cron", "update_job", jid, "one-shot moved; update its single instant",
+                                   updates={"schedule": ev["start"]}))
+                elif job.get("copy_error"):
+                    ops.append(_op("report", "notice", jid, "move refused: " + job["copy_error"]))
+                elif not job.get("next_after"):
+                    ops.append(_op("report", "notice", jid, "move refused: cannot calculate next occurrence safely"))
+                else:
+                    args = dict(job.get("copy_args") or {"prompt": job.get("prompt", "")})
+                    args.update(schedule=ev["start"], repeat=1,
+                                name=f"{job.get('name') or jid} (moved {ev['start'][:10]})")
+                    ops.append(_op("calendar->cron", "create_once", jid,
+                                   "moved occurrence creates one-shot copy; recurring schedule unchanged",
+                                   create_args=args, event_id=ev["id"], moved_start=ev["start"],
+                                   original_slot=job.get("start"), board_start=job["next_after"],
+                                   warning=SKIP_WARNING))
             else:
                 ops.append(_op("state", "record", jid, "event moved while job paused: kept on calendar only",
                                event_id=ev["id"]))
@@ -100,26 +135,24 @@ def plan(jobs: List[Dict[str, Any]], events: List[Dict[str, Any]], state: Dict[s
             if name and name != job.get("name"):
                 ops.append(_op("calendar->cron", "update_job", jid, "event retitled", updates={"name": name}))
         if (not moved and not retitled and job.get("enabled", True) and job.get("start")
-                and instant(ev.get("start")) != instant(job["start"])):
+                and instant(ev.get("start")) != instant(body["start"])):
             ops.append(_op("cron->calendar", "patch_event", jid, "cron next run advanced",
-                           event_id=ev["id"], event={"start": job["start"]}))
+                           event_id=ev["id"], event={"start": body["start"]}))
     return ops
 
 
-def moved_schedule(schedule: Any, start: str) -> Optional[str]:
-    """New schedule string for a human move: one-shot -> the new instant; 5-field cron -> same
-    days, new wall-clock minute/hour; intervals can't follow (None)."""
-    if not isinstance(schedule, str):
-        return None
-    dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-    fields = schedule.split()
-    if len(fields) == 5 and fields[0].isdigit() and fields[1].isdigit():
-        return " ".join([str(dt.minute), str(dt.hour), *fields[2:]])
-    try:
-        datetime.fromisoformat(schedule)
-        return dt.isoformat()
-    except ValueError:
-        return None
+SKIP_WARNING = ("Hermes cronjob_manage has no skip-occurrence API. The original occurrence WILL still run; "
+                "this creates an ADDITIONAL one-shot, not an exact reschedule. No pause or schedule rewrite is attempted. "
+                "The source event previews its following slot; the original slot still runs in Hermes.")
+
+
+def resume_command(jid: str) -> str:
+    import shlex
+    return "hermes cron resume " + shlex.quote(jid)
+
+
+def pause_message(jid: str) -> str:
+    return f"job {jid} paused because its calendar event was deleted; resume with {resume_command(jid)}"
 
 
 def _differs(ev: Dict[str, Any], body: Dict[str, Any]) -> bool:
