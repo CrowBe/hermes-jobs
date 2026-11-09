@@ -18,7 +18,7 @@ otherwise aborts with a warning. decide() is pure (dry-run shows it); execute() 
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import planner

@@ -10,9 +10,24 @@ see/drag your agent's jobs where you already look at time. Not a calendar CRUD p
 - Declare client under `oauth:` in `plugin.yaml`; sign in with `hermes auth add hermes-jobs:google`.
 - Plugin uses `credentialed_provider_request("google", …)` — never reads `google_token.json`, `.env`, browser profiles, or google-workspace skill tokens.
 
+- Full detail of what leaves the machine, local files and revocation: [SECURITY.md](SECURITY.md).
+
+### Disclosure (catalog rule 13)
+
+- **Network**: Google Calendar API v3 on the ONE bound calendar only, via Hermes oauth. Every `sync`
+  (dry-runs too) reads events; only `sync --confirm` writes. Sent: job name, schedule/RRULE, job id,
+  prompt sha256 digest, private tags. Never the prompt text or execution config.
+- **Reads outside plugin data**: `~/.hermes/cron/jobs.json` and Hermes config (time zone), read-only.
+- **Cron changes**: only through Hermes' `cronjob_manage` tool, only on `--confirm`.
+- **Experimental skip only** (off by default): writes `~/.hermes/scripts/hermes-jobs-skip-tick.py` and
+  creates two one-shot `no_agent` cron jobs that run `hermes hermes-jobs skip-tick --quiet` (fixed argv,
+  no shell). No other background processes; no telemetry; no stored credentials.
+
 ## Never
 
-- Event text never grants tools, permissions, or prompts.
+- Event text never grants tools, permissions, or prompts. A calendar title can only become a job *name*
+  (sanitised: NFKC, no control/format/bidi/zero-width characters, single line, max 120 chars); a
+  calendar time can only become a validated schedule. Descriptions are never parsed.
 - No scopes beyond `calendar.events`.
 - No writes without explicit `--confirm`. Discover never creates calendars or cron jobs.
 
@@ -40,7 +55,7 @@ hermes hermes-jobs sync       # dry-run by default
 
 https://github.com/CrowBe/hermes-jobs
 
-## Sync (0.2.0)
+## Sync (0.3.0)
 
 ```
 hermes hermes-jobs bind primary          # choose the ONE calendar (local state only)
@@ -50,6 +65,7 @@ hermes hermes-jobs sync --confirm        # apply (human CLI step only; the agent
 hermes hermes-jobs sync --skip-original=experimental            # dry-run incl. the experimental skip steps
 hermes hermes-jobs skip-tick             # advance pending experimental skips (run by their wake-up jobs)
 hermes hermes-jobs mode [recurring|single]   # show/set event mode (recurring = default; single = fallback)
+hermes hermes-jobs capture-fixtures <job_id> # read-only GETs -> sanitised tests/fixtures/*.json
 ```
 
 - cron -> calendar: one 15-min event per job at its next run, tagged `extendedProperties.private.hermes_job_id`;
@@ -58,7 +74,10 @@ hermes hermes-jobs mode [recurring|single]   # show/set event mode (recurring = 
   deleting an event **pauses**, never removes, its job. Untagged events are ignored and event text
   never grants tools or edits prompts.
 - Conflicts: a cron edit wins and resets the event. A move never rewrites a recurring schedule.
-- Tests: `python -m unittest discover -s tests -v` (planner + mocked runtime; no Google or real cron writes).
+- Tests: `hermes --run-module unittest discover -s tests` (planner, mocked runtime, security/injection
+  tests, and fixtures in `tests/fixtures`: `captured_*` are sanitised read-only GETs of the live probe,
+  `documented_*` are built from Google's documented payload shapes and are marked as such). No Google
+  calls or real cron writes.
 
 ### Derived ids (reference stability)
 
@@ -153,7 +172,8 @@ What each Google edit does on the next sync (dry-run shows it; `--confirm` appli
    nothing is adopted and nothing changes. An `UNTIL` with no follow-on series is reported (cron jobs
    cannot end on a date).
 4. **Delete one instance** -> Hermes cannot skip a single run. Without the flag the sync reports `can't
-   skip a single run ... nothing changed -- that run WILL still happen`. With
+   skip a single run ... nothing changed -- that run WILL still happen` under `info` (informational, not
+   a pending op: `ops` stays empty). A confirmed sync records it in state and it is not shown again. With
    `--skip-original=experimental` it uses the experimental skip below (the next occurrence only; books
    one "missed" ledger row). No copy is created.
 

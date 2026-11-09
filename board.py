@@ -12,7 +12,7 @@ History masters (ours, shortened with UNTIL by a split) are never edited, adopte
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from . import planner, rrule
@@ -25,8 +25,12 @@ def _wall(ev: Dict[str, Any], tz: Optional[str]) -> Optional[datetime]:
     if not ev.get("start"):
         return None
     dt = datetime.fromisoformat(ev["start"].replace("Z", "+00:00"))
-    zone = ev.get("tz") or tz
-    return dt.astimezone(ZoneInfo(zone)) if zone else dt
+    for zone in (ev.get("tz"), tz):
+        try:
+            return dt.astimezone(ZoneInfo(zone)) if zone else dt
+        except Exception:  # noqa: BLE001 -- untrusted zone string from Calendar
+            continue
+    return dt
 
 
 def is_master(ev) -> bool:
@@ -234,7 +238,7 @@ def _plan_job(job, last, cur, series, exceptions, occurrences, recurring) -> Lis
             ops.append(_op("calendar->cron", "update_job", jid, "'all events' changed in Calendar: cron follows "
                            f"({job['cron_expr']} -> {expr})", updates={"schedule": expr}))
     if cur.get("summary") != last.get("summary"):
-        name = (cur.get("summary") or "").removeprefix(P.PAUSED).strip()
+        name = P.clean_name(cur.get("summary"))
         if name and name != job.get("name"):
             ops.append(_op("calendar->cron", "update_job", jid, "series retitled", updates={"name": name}))
 
@@ -251,7 +255,7 @@ def _plan_job(job, last, cur, series, exceptions, occurrences, recurring) -> Lis
                 ops.append(_op("calendar->cron", "pause_job", rec["child_id"],
                                P.pause_message(rec["child_id"]) + " (moved instance deleted)",
                                resume_command=P.resume_command(rec["child_id"]), occurrence=key))
-            elif not rec:
+            elif not rec or rec.get("status") == "noticed":
                 ops.append(_op("calendar->cron", "skip_instance", jid, f"instance {orig} deleted in Calendar",
                                original_slot=orig, occurrence=key, fingerprint=P.fingerprint(job), event_id=e["id"]))
             continue
@@ -272,5 +276,5 @@ def _plan_job(job, last, cur, series, exceptions, occurrences, recurring) -> Lis
             ops.append(_op("calendar->cron", "create_once", jid, "'this event' moved: one-shot copy; series unchanged",
                            create_args=args, event_id=e["id"], moved_start=e["start"], original_slot=orig,
                            board_start=None, occurrence=key, fingerprint=P.fingerprint(job),
-                           schedule_kind=job.get("schedule_kind"), instance_backed=True, warning=P.SKIP_WARNING))
+                           schedule_kind=job.get("schedule_kind"), instance_backed=True, warning=P.INSTANCE_SKIP_WARNING))
     return ops

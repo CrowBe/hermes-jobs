@@ -85,6 +85,18 @@ def format_cron(spec: Spec) -> str:
     return f"{spec['minute']} {spec['hour']} {f(spec['dom'])} {f(spec['mon'])} {f(spec['dow'])}"
 
 
+def is_cron(expr: str) -> bool:
+    """True only for a plain 5-field expression this module can parse (digits, names, , - * /)."""
+    import re as _re
+    if not isinstance(expr, str) or len(expr) > 100 or not _re.fullmatch(r"[0-9A-Za-z*,/\- ]+", expr):
+        return False
+    try:
+        parse_cron(expr)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def canonical_cron(expr: str) -> str:
     return format_cron(parse_cron(expr))
 

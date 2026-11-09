@@ -94,6 +94,29 @@ def copy_props(last: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 
+NAME_MAX = 120
+
+
+def clean_name(text: Optional[str]) -> str:
+    """Calendar title -> cron job name. Event text is untrusted: NFKC-normalise, drop control,
+    format (bidi overrides, zero-width), private-use and unassigned characters, turn newlines/tabs
+    into spaces, collapse whitespace, strip the [paused] prefix and cap the length. The result is
+    only ever a cron *name* (display metadata); it never reaches a prompt, a tool list or a shell."""
+    import unicodedata
+    out = []
+    for ch in unicodedata.normalize("NFKC", text or ""):
+        cat = unicodedata.category(ch)
+        if cat in {"Cc", "Zl", "Zp"}:
+            out.append(" ")
+        elif cat in {"Cf", "Co", "Cs", "Cn"}:
+            continue
+        else:
+            out.append(ch)
+    name = " ".join("".join(out).split())
+    name = name.removeprefix(PAUSED.strip()).strip()
+    return name[:NAME_MAX].rstrip()
+
+
 def _op(direction: str, action: str, job_id: str, reason: str, **kw: Any) -> Dict[str, Any]:
     return {"direction": direction, "action": action, "job_id": job_id, "reason": reason, **kw}
 
@@ -205,7 +228,7 @@ def plan(jobs: List[Dict[str, Any]], events: List[Dict[str, Any]], state: Dict[s
                 ops.append(_op("state", "record", jid, "event moved while job paused: kept on calendar only",
                                event_id=ev["id"]))
         if retitled:
-            name = (ev.get("summary") or "").removeprefix(PAUSED).strip()
+            name = clean_name(ev.get("summary"))
             if name and name != job.get("name"):
                 ops.append(_op("calendar->cron", "update_job", jid, "event retitled", updates={"name": name}))
         if (not moved and not retitled and job.get("enabled", True) and job.get("start")
@@ -220,6 +243,12 @@ def plan(jobs: List[Dict[str, Any]], events: List[Dict[str, Any]], state: Dict[s
               and (j.get("name"), instant(j.get("start"))) in pending}
     return [o for o in ops if not (o["action"] == "insert_event" and o["job_id"] in landed)]
 
+
+INSTANCE_SKIP_WARNING = (
+    "Hermes cronjob_manage has no skip-occurrence API. The original occurrence WILL still run; this creates an "
+    "ADDITIONAL one-shot at the moved time, not an exact reschedule. The recurring series is unchanged. The moved "
+    "Calendar instance stands for the one-shot copy, so Calendar no longer shows the original slot, but Hermes "
+    "still runs it.")
 
 SKIP_WARNING = ("Hermes cronjob_manage has no skip-occurrence API. The original occurrence WILL still run; "
                 "this creates an ADDITIONAL one-shot, not an exact reschedule. No pause or schedule rewrite is attempted. "

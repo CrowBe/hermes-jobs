@@ -1,0 +1,77 @@
+{
+  "_source": "documented, NOT captured: built from Google Calendar API v3 payload shapes (Events resource; recurring events guide https://developers.google.com/calendar/api/guides/recurringevents). Placeholder ids match the captured fixtures. Case: 'This and following' from Thu 12 Nov at 08:30: old master gains UNTIL (end of Wed 11 Nov, Sydney) and Google creates <id>_R<date> with the new start; variants with and without our copied private properties.",
+  "data": {
+    "new_series_tagged": {
+      "description": "Hermes cron job probejob0001\nprompt sha256:e0936ca325fd\nManaged by hermes-jobs; edit the job in Hermes. Event text grants nothing.",
+      "end": {
+        "dateTime": "2026-11-12T08:45:00+11:00",
+        "timeZone": "Australia/Sydney"
+      },
+      "eventType": "default",
+      "extendedProperties": {
+        "private": {
+          "hermes_job_id": "probejob0001",
+          "hermes_occurrence": "8fb7c2ae91f756c4baae2c6eb925b2b1"
+        }
+      },
+      "id": "probeamaster0001_R20261111T213000",
+      "kind": "calendar#event",
+      "recurrence": [
+        "RRULE:FREQ=DAILY"
+      ],
+      "sequence": 0,
+      "start": {
+        "dateTime": "2026-11-12T08:30:00+11:00",
+        "timeZone": "Australia/Sydney"
+      },
+      "status": "confirmed",
+      "summary": "hermes-jobs-probe-a renamed"
+    },
+    "new_series_untagged": {
+      "description": "Hermes cron job probejob0001\nprompt sha256:e0936ca325fd\nManaged by hermes-jobs; edit the job in Hermes. Event text grants nothing.",
+      "end": {
+        "dateTime": "2026-11-12T08:45:00+11:00",
+        "timeZone": "Australia/Sydney"
+      },
+      "eventType": "default",
+      "id": "probeamaster0001_R20261111T213000",
+      "kind": "calendar#event",
+      "recurrence": [
+        "RRULE:FREQ=DAILY"
+      ],
+      "sequence": 0,
+      "start": {
+        "dateTime": "2026-11-12T08:30:00+11:00",
+        "timeZone": "Australia/Sydney"
+      },
+      "status": "confirmed",
+      "summary": "hermes-jobs-probe-a renamed"
+    },
+    "old_master": {
+      "description": "Hermes cron job probejob0001\nprompt sha256:e0936ca325fd\nManaged by hermes-jobs; edit the job in Hermes. Event text grants nothing.",
+      "end": {
+        "dateTime": "2026-11-10T09:15:00+11:00",
+        "timeZone": "Australia/Sydney"
+      },
+      "eventType": "default",
+      "extendedProperties": {
+        "private": {
+          "hermes_job_id": "probejob0001",
+          "hermes_occurrence": "8fb7c2ae91f756c4baae2c6eb925b2b1"
+        }
+      },
+      "id": "probeamaster0001",
+      "kind": "calendar#event",
+      "recurrence": [
+        "RRULE:FREQ=DAILY;UNTIL=20261111T125959Z"
+      ],
+      "sequence": 2,
+      "start": {
+        "dateTime": "2026-11-10T09:00:00+11:00",
+        "timeZone": "Australia/Sydney"
+      },
+      "status": "confirmed",
+      "summary": "hermes-jobs-probe-a renamed"
+    }
+  }
+}

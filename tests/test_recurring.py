@@ -148,6 +148,8 @@ class FourCasesTest(unittest.TestCase):
         self.assertEqual(acts(ops), ["create_once"])
         op = ops[0]
         self.assertTrue(op["instance_backed"])
+        self.assertEqual(op["warning"], P.INSTANCE_SKIP_WARNING)
+        self.assertNotIn("previews its following slot", op["warning"])
         self.assertEqual((op["create_args"]["schedule"], op["original_slot"]), (moved, T11))
         self.assertEqual(op["occurrence"], P.occurrence_key("j1", T11))
         recs = {op["occurrence"]: {"source_job_id": "j1", "child_id": "c1", "status": "pending",
@@ -287,9 +289,28 @@ class RecurringRuntimeTest(TR.RuntimeTest):
         self.events = [master(), inst(None, T11, status="cancelled", hermes_job_id=None)]
         M._save_state({"calendar_id": "test-calendar", "jobs": rstate()})
         res = M.sync()
-        self.assertEqual(acts(res["ops"]), ["notice"])
-        self.assertIn("can't skip a single run", res["messages"][0])
-        self.assertIn("nothing changed", res["messages"][0])
+        self.assertEqual((res["ops"], res["pending_ops"]), ([], 0))  # informational, not a pending op
+        self.assertIn("can't skip a single run", res["info"][0])
+        self.assertIn("nothing changed", res["info"][0])
+        self.assertEqual(M.sync()["info"], res["info"])  # dry-runs keep showing it (no state writes)
+        done = M.sync(confirm=True)
+        self.assertEqual((done["writes"], done["errors"]), (0, []))
+        self.dispatch.assert_not_called()
+        self.cal.patch.assert_not_called()
+        again = M.sync()
+        self.assertEqual((again["ops"], again["info"]), ([], []))  # recorded once, shown once
+
+    def test_noticed_instance_can_still_be_skipped_with_flag(self):
+        slot = "2030-01-02T09:00:00+11:00"
+        self.jobs = [rjob(start=slot)]
+        self.raw = [{"id": "j1", "schedule": {"kind": "cron", "expr": "0 9 * * *"}, "enabled": True,
+                     "next_run_at": slot}]
+        self.events = [master(), inst(None, slot, status="cancelled", hermes_job_id=None)]
+        key = P.occurrence_key("j1", slot)
+        M._save_state({"calendar_id": "test-calendar", "jobs": rstate(),
+                       "occurrences": {key: {"key": key, "source_job_id": "j1", "status": "noticed", "mode": "notice"}}})
+        self.assertEqual(M.sync()["info"], [])
+        self.assertEqual(acts(M.sync(skip_original="experimental")["ops"]), ["skip_instance"])
 
     def test_deleted_instance_with_flag_routes_to_experimental_skip(self):
         slot = "2030-01-02T09:00:00+11:00"

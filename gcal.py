@@ -6,6 +6,7 @@ Never reads google_token.json, .env, or any other token store.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode
@@ -31,7 +32,7 @@ def _req(method: str, url: str, body: Optional[dict] = None) -> Any:
     if resp.status == 409:
         raise Conflict(f"{method} {url.split('?')[0]} -> 409")
     if resp.status >= 300:
-        raise CalendarError(f"{method} {url.split('?')[0]} -> {resp.status}: {resp.text[:200]}")
+        raise CalendarError(f"{method} {url.split('?')[0]} -> {resp.status}: {_error_message(resp)}")
     return resp.json() if resp.body else None
 
 
@@ -76,6 +77,11 @@ class Calendar:
             if not token:
                 return out
 
+    def get_raw(self, path: str = "", **query: Any) -> Any:
+        """Read-only GET of raw Google JSON under this calendar's events (fixture capture)."""
+        q = f"?{urlencode(query)}" if query else ""
+        return _req("GET", f"{self.base}{path}{q}")
+
     def insert(self, ev: Dict[str, Any]) -> Dict[str, Any]:
         """Insert with the derived id when given. 409 = already exists (an earlier attempt landed,
         or the id was used by an event since deleted): adopt it by patching it to the desired body
@@ -99,6 +105,60 @@ class Calendar:
 
     def delete(self, event_id: str) -> None:
         _req("DELETE", f"{self.base}/{quote(event_id, safe='')}")
+
+
+def _error_message(resp) -> str:
+    """Only Google's error message (never headers or the raw body), capped and redacted."""
+    try:
+        msg = str(((resp.json() or {}).get("error") or {}).get("message") or "")
+    except Exception:  # noqa: BLE001
+        msg = ""
+    return redact(msg)[:200] or "no error message"
+
+
+_SECRET_PATTERNS = None
+
+
+def redact(text: str) -> str:
+    """Belt and braces for anything printed: mask bearer tokens and Google token shapes."""
+    global _SECRET_PATTERNS
+    import re
+    if _SECRET_PATTERNS is None:
+        _SECRET_PATTERNS = [re.compile(p) for p in (
+            r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+", r"ya29\.[A-Za-z0-9._-]+", r"1//[A-Za-z0-9._-]{10,}",
+            r"GOCSPX-[A-Za-z0-9_-]+",
+            r"(?i)(access_token|refresh_token|id_token|client_secret|authorization)([\"']?\s*[:=]\s*[\"']?)[^\s\"',}]+")]
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub(lambda m: (m.group(1) + m.group(2) if m.lastindex and m.lastindex >= 2 else "") + "[redacted]",
+                       text)
+    return text
+
+
+def instant(value: Any) -> Optional[str]:
+    """Calendar timestamps are untrusted: only a timezone-aware ISO-8601 instant survives,
+    re-serialised canonically. Anything else (all-day dates, junk, oversized) reads as None."""
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.isoformat() if dt.tzinfo else None
+
+
+def _zone(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(value)
+        return value
+    except Exception:  # noqa: BLE001
+        return "invalid"  # never equals a job zone: series-zone changes are refused
+
+
+def _text(value: Any, cap: int) -> Optional[str]:
+    return value[:cap] if isinstance(value, str) else None
 
 
 def _same(a: str, b: str) -> bool:
@@ -126,8 +186,9 @@ def to_google(ev: Dict[str, Any]) -> Dict[str, Any]:
 def from_google(g: Dict[str, Any]) -> Dict[str, Any]:
     private = (g.get("extendedProperties") or {}).get("private") or {}
     common = {"status": g.get("status") or "confirmed", "recurring_event_id": g.get("recurringEventId"),
-              "original_start": (g.get("originalStartTime") or {}).get("dateTime"),
-              "recurrence": g.get("recurrence"), "tz": (g.get("start") or {}).get("timeZone")}
+              "original_start": instant((g.get("originalStartTime") or {}).get("dateTime")),
+              "recurrence": [r for r in (g.get("recurrence") or []) if isinstance(r, str) and len(r) <= 512][:16]
+              or None, "tz": _zone((g.get("start") or {}).get("timeZone"))}
     if g.get("status") == "cancelled":
         # Cancelled masters/singles read as gone; cancelled instances keep their identity.
         return {"id": g.get("id"), "hermes_job_id": None, "props": {}, "summary": None,
@@ -136,8 +197,21 @@ def from_google(g: Dict[str, Any]) -> Dict[str, Any]:
         **common,
         "id": g.get("id"),
         "props": {k: v for k, v in private.items() if k != TAG},
-        "summary": g.get("summary"),
-        "description": g.get("description"),
-        "start": (g.get("start") or {}).get("dateTime"),
+        "summary": _text(g.get("summary"), 1024),
+        "description": _text(g.get("description"), 8192),  # compared only, never interpreted
+        "start": instant((g.get("start") or {}).get("dateTime")),
         "hermes_job_id": ((g.get("extendedProperties") or {}).get("private") or {}).get(TAG),
     }
+
+
+FIXTURE_KEYS = {"kind", "status", "summary", "description", "start", "end", "recurrence", "recurringEventId",
+                "originalStartTime", "extendedProperties", "eventType", "id", "sequence"}
+
+
+def sanitise(g: Dict[str, Any], replace: Dict[str, str]) -> Dict[str, Any]:
+    """Fixture form of a raw Google event: allow-listed keys only (no organizer/creator emails,
+    htmlLink, iCalUID, etag, calendar id), with real ids swapped for placeholders."""
+    text = json.dumps({k: v for k, v in g.items() if k in FIXTURE_KEYS}, sort_keys=True)
+    for real, fake in sorted(replace.items(), key=lambda kv: -len(kv[0])):
+        text = text.replace(real, fake)
+    return json.loads(text)
