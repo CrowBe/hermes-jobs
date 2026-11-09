@@ -24,6 +24,7 @@ class RuntimeTest(unittest.TestCase):
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
         self.jobs = [job()]
+        self.raw = []
         self.events = []
         self.cal = MagicMock()
         self.dispatch = MagicMock(return_value=json.dumps({"success": True}))
@@ -32,6 +33,7 @@ class RuntimeTest(unittest.TestCase):
         self.registry_patch.start()
         self.addCleanup(self.registry_patch.stop)
         self.patches = [patch.object(M, "_crons", side_effect=lambda: self.jobs),
+                        patch.object(M, "_raw_jobs", side_effect=lambda: self.raw),
                         patch.object(M, "_events", side_effect=lambda *_: self.events),
                         patch(M.__name__ + ".gcal.Calendar", return_value=self.cal)]
         for p in self.patches:
@@ -86,11 +88,19 @@ class RuntimeTest(unittest.TestCase):
         M._apply(retry, "test-calendar")
         self.assertEqual(self.dispatch.call_count, 1)
 
-    def test_unknown_create_result_requires_reconciliation(self):
-        self.dispatch.return_value = "not JSON"
+    def test_unknown_create_result_retry_adopts_existing_copy(self):
+        self.dispatch.return_value = "not JSON"  # create landed but its result was lost
         ops = M.planner.plan(self.jobs, [ev(start=T10)], synced())
         self.assertTrue(M._apply(ops, "test-calendar")[1])
-        self.assertEqual(M.planner.plan(self.jobs, [ev(start=T10)], M._load_state()["jobs"])[0]["action"], "notice")
+        self.raw = [{"id": "landed", "name": ops[0]["create_args"]["name"], "state": "scheduled",
+                     "schedule": {"kind": "once", "run_at": T10}}]
+        self.jobs.append(job(id="landed", name=ops[0]["create_args"]["name"], schedule_kind="once", start=T10))
+        self.dispatch.reset_mock()
+        retry = M.planner.plan(self.jobs, [ev(start=T10)], M._load_state()["jobs"])
+        self.assertEqual([o["action"] for o in retry], ["create_once"])  # no duplicate event for the copy
+        self.assertFalse(M._apply(retry, "test-calendar")[1])
+        self.dispatch.assert_not_called()  # adopted, no duplicate
+        self.assertEqual(M._load_state()["occurrences"][retry[0]["occurrence"]]["child_id"], "landed")
 
     def test_confirm_requires_explicit_additional_run_opt_in(self):
         self.events = [ev(start=T10)]
@@ -149,7 +159,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_offline_real_event_fetch_is_guarded(self):
         # Exercise actual helper, not the _events test mock: no Calendar object is built.
-        self.patches[1].stop()
+        self.patches[2].stop()
         self.assertEqual(M._events("test-calendar", True), [])
         self.cal.list_tagged.assert_not_called()
 

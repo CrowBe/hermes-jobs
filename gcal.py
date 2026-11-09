@@ -19,11 +19,17 @@ class CalendarError(RuntimeError):
     pass
 
 
+class Conflict(CalendarError):
+    """409: an event with this client-chosen id already exists (possibly cancelled)."""
+
+
 def _req(method: str, url: str, body: Optional[dict] = None) -> Any:
     from hermes_cli.plugin_provider_requests import credentialed_provider_request
     resp = credentialed_provider_request("google", method, url, json=body, timeout=20)
     if resp.status == 410 and method == "DELETE":
         return None  # already gone
+    if resp.status == 409:
+        raise Conflict(f"{method} {url.split('?')[0]} -> 409")
     if resp.status >= 300:
         raise CalendarError(f"{method} {url.split('?')[0]} -> {resp.status}: {resp.text[:200]}")
     return resp.json() if resp.body else None
@@ -47,7 +53,22 @@ class Calendar:
                 return out
 
     def insert(self, ev: Dict[str, Any]) -> Dict[str, Any]:
-        return from_google(_req("POST", self.base, to_google(ev)))
+        """Insert with the derived id when given. 409 = already exists (an earlier attempt landed,
+        or the id was used by an event since deleted): adopt it by patching it to the desired body
+        (status confirmed revives a cancelled one). Refuse if it belongs to another job."""
+        try:
+            return from_google(_req("POST", self.base, to_google(ev)))
+        except Conflict:
+            if not ev.get("id"):
+                raise
+            url = f"{self.base}/{quote(ev['id'], safe='')}"
+            existing = _req("GET", url) or {}
+            tag = ((existing.get("extendedProperties") or {}).get("private") or {}).get(TAG)
+            if tag and tag != ev.get("hermes_job_id"):
+                raise CalendarError(f"event id {ev['id']} already belongs to job {tag}; not adopting")
+            body = {k: v for k, v in to_google(ev).items() if k != "id"}
+            body["status"] = "confirmed"
+            return from_google(_req("PATCH", url, body))
 
     def patch(self, event_id: str, ev: Dict[str, Any]) -> Dict[str, Any]:
         return from_google(_req("PATCH", f"{self.base}/{quote(event_id, safe='')}", to_google(ev)))
@@ -58,20 +79,25 @@ class Calendar:
 
 def to_google(ev: Dict[str, Any]) -> Dict[str, Any]:
     g: Dict[str, Any] = {k: ev[k] for k in ("summary", "description") if k in ev}
+    if ev.get("id"):
+        g["id"] = ev["id"]
     if ev.get("start"):
         start = datetime.fromisoformat(ev["start"])
         g["start"] = {"dateTime": start.isoformat()}
         g["end"] = {"dateTime": (start + timedelta(minutes=MINUTES)).isoformat()}
     if ev.get("hermes_job_id"):
-        g["extendedProperties"] = {"private": {TAG: ev["hermes_job_id"]}}
+        # Always write the FULL private set so PATCH can never strip the job tag.
+        g["extendedProperties"] = {"private": {**(ev.get("props") or {}), TAG: ev["hermes_job_id"]}}
     return g
 
 
 def from_google(g: Dict[str, Any]) -> Dict[str, Any]:
     if g.get("status") == "cancelled":
         return {"id": g.get("id"), "hermes_job_id": None}
+    private = (g.get("extendedProperties") or {}).get("private") or {}
     return {
         "id": g.get("id"),
+        "props": {k: v for k, v in private.items() if k != TAG},
         "summary": g.get("summary"),
         "description": g.get("description"),
         "start": (g.get("start") or {}).get("dateTime"),

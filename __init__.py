@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import planner
+from . import planner, skip
 
 SCOPE = "https://www.googleapis.com/auth/calendar.events"
 AUTH_HINT = "hermes auth add hermes-jobs:google"
@@ -119,25 +119,38 @@ def _copy_args(raw: dict) -> dict:
     return args
 
 
+def _is_wake_job(raw: dict) -> bool:
+    """Our own experimental-skip wake-ups never appear on the board."""
+    return str(raw.get("name") or "").startswith(skip.WAKE_PREFIX) and raw.get("script") == skip.SCRIPT_NAME
+
+
+def _view(raw: dict) -> dict:
+    """Planner view of one raw cron record. Prompts never flow to Calendar."""
+    sched = raw.get("schedule") or {}
+    start = _next_start(raw)
+    paused = not raw.get("enabled", True) or raw.get("state") == "paused"
+    paused_by = None
+    if paused and raw.get("paused_reason") == planner.DELETE_MARKER:
+        paused_by = "delete"
+    elif paused and skip.parse_marker(raw.get("paused_reason")):
+        paused_by = "skip"  # our transient experimental-skip pause: board shows it as active
+    j = {"id": raw["id"], "name": raw.get("name"), "prompt": raw.get("prompt") or "",
+         "schedule": raw.get("schedule_display") or sched.get("display") or sched,
+         "schedule_kind": sched.get("kind"), "enabled": not paused or paused_by == "skip",
+         "paused_by": paused_by, "terminal": raw.get("state") in {"completed", "error"}, "start": start}
+    try:
+        j["copy_args"] = _copy_args(raw)
+        if start and sched.get("kind") in {"cron", "interval"}:
+            # Mirror Hermes wall-clock/DST calculation without importing private cron internals.
+            j["next_after"] = _following_start(raw, start)
+    except (ValueError, KeyError, TypeError) as exc:
+        j["copy_error"] = str(exc)
+    return j
+
+
 def _crons() -> list:
-    """Read-only view. No scheduler writes; prompts never flow to Calendar."""
-    out = []
-    for raw in _raw_jobs():
-        sched = raw.get("schedule") or {}
-        start = _next_start(raw)
-        j = {"id": raw["id"], "name": raw.get("name"), "prompt": raw.get("prompt") or "",
-             "schedule": raw.get("schedule_display") or sched.get("display") or sched,
-             "schedule_kind": sched.get("kind"), "enabled": raw.get("enabled", True) and raw.get("state") != "paused",
-             "terminal": raw.get("state") in {"completed", "error"}, "start": start}
-        try:
-            j["copy_args"] = _copy_args(raw)
-            if start and sched.get("kind") in {"cron", "interval"}:
-                # Mirror Hermes wall-clock/DST calculation without importing private cron internals.
-                j["next_after"] = _following_start(raw, start)
-        except (ValueError, KeyError, TypeError) as exc:
-            j["copy_error"] = str(exc)
-        out.append(j)
-    return out
+    """Read-only view. No scheduler writes."""
+    return [_view(raw) for raw in _raw_jobs() if not _is_wake_job(raw)]
 
 
 def _state_file() -> Path:
@@ -154,7 +167,7 @@ def _load_state() -> Dict[str, Any]:
     try:
         return json.loads(f.read_text(encoding="utf-8"))
     except Exception:
-        return {"calendar_id": None, "jobs": {}}
+        return {"calendar_id": None, "jobs": {}, "occurrences": {}}
 
 
 def _save_state(state: Dict[str, Any]) -> None:
@@ -229,34 +242,142 @@ def bind(calendar_id: str) -> Dict[str, Any]:
     """Choose the ONE calendar to sync (local state only). Rebinding forgets prior event links."""
     st = _load_state()
     if st.get("calendar_id") != calendar_id:
-        st = {"calendar_id": calendar_id, "jobs": {}}
+        st = {"calendar_id": calendar_id, "jobs": {}, "occurrences": {}}
         _save_state(st)
     return {"calendar_id": calendar_id, "state_file": str(_state_file())}
 
 
-def sync(confirm: bool = False, offline: bool = False, allow_additional_run: bool = False) -> Dict[str, Any]:
+SKIP_MODES = (None, "experimental")
+
+
+def _now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
+def _refresh_occurrences(st: Dict[str, Any], raw_jobs: list) -> Dict[str, Any]:
+    """Rebuild armed skips from cron markers; retire copies that have fired or vanished."""
+    recs = st.setdefault("occurrences", {})
+    skip.rebuild(raw_jobs, recs, lambda raw: planner.fingerprint(_view(raw)))
+    by_id = {r["id"]: r for r in raw_jobs}
+    for rec in recs.values():
+        if rec.get("status") == "pending" and rec.get("child_id"):
+            child = by_id.get(rec["child_id"])
+            if child is None or child.get("state") in {"completed", "error"}:
+                rec["status"] = "fired" if child else "gone"
+    return recs
+
+
+def _skip_decisions(recs: Dict[str, Any], raw_jobs: list) -> List[Dict[str, Any]]:
+    by_id = {r["id"]: r for r in raw_jobs}
+    out = []
+    for key, rec in sorted(recs.items()):
+        if rec.get("mode") != "skip":
+            continue
+        raw = by_id.get(rec.get("source_job_id"))
+        fp = planner.fingerprint(_view(raw)) if raw else None
+        actions, warnings = skip.decide(rec, raw, fp, _now())
+        if actions or warnings:
+            out.append({"occurrence": key, "job_id": rec.get("source_job_id"), "actions": actions, "warnings": warnings})
+    return out
+
+
+def sync(confirm: bool = False, offline: bool = False, allow_additional_run: bool = False,
+         skip_original: Optional[str] = None) -> Dict[str, Any]:
+    if skip_original not in SKIP_MODES:
+        return {"refused": True, "reason": "--skip-original accepts only 'experimental'", "writes": 0}
     st = _load_state()
     cal = st.get("calendar_id")
     if confirm and (offline or not cal):
         return {"refused": True, "reason": "--confirm needs a bound calendar and no --offline", "writes": 0}
     try:
+        raw_jobs = _raw_jobs()
         jobs, events = _crons(), _events(cal, offline)
     except Exception as exc:  # noqa: BLE001 -- not signed in, HTTP error, ...
         return {"error": f"{type(exc).__name__}: {exc}", "sign_in": AUTH_HINT, "writes": 0}
-    ops = planner.plan(jobs, events, {} if offline else st.get("jobs", {}))
+    recs = {} if offline else _refresh_occurrences(st, raw_jobs)
+    decisions = _skip_decisions(recs, raw_jobs)
+    ops = planner.plan(jobs, events, {} if offline else st.get("jobs", {}), recs)
+    raw_by_id = {r["id"]: r for r in raw_jobs}
+    for op in ops:
+        if op["action"] != "create_once":
+            continue
+        op["mode"] = "additional"
+        if skip_original == "experimental":
+            why = skip.eligibility(raw_by_id[op["job_id"]], op["original_slot"], _now())
+            if why:
+                op["skip_refused"] = why
+            else:
+                op.update(mode="skip", skip_steps=skip.steps(op["original_slot"]), warning=SKIP_EXPERIMENTAL_WARNING)
     out: Dict[str, Any] = {"dry_run": not confirm, "calendar_id": cal, "offline": offline or not cal,
                            "events_seen": len(events), "ops": ops, "writes": 0,
-                           "messages": [o["reason"] for o in ops if o["action"] in {"pause_job", "notice"}],
-                           "warnings": [o["warning"] for o in ops if o.get("warning")]}
-    if confirm and any(o["action"] == "create_once" for o in ops) and not allow_additional_run:
-        out.update(refused=True, reason="Exact occurrence suppression is unavailable. Review the duplicate-run warning, then explicitly use --confirm --allow-additional-run to create an additional run.")
+                           "messages": [o["reason"] for o in ops if o["action"] in {"pause_job", "notice"}]
+                           + [f"experimental skip refused for {o['job_id']}: {o['skip_refused']}"
+                              for o in ops if o.get("skip_refused")],
+                           "warnings": [o["warning"] for o in ops if o.get("warning")]
+                           + [w for d in decisions for w in d["warnings"]]}
+    if decisions:
+        out["skip_reconcile"] = decisions
+    unapproved = [o for o in ops if o["action"] == "create_once" and o["mode"] == "additional" and not allow_additional_run]
+    if confirm and unapproved:
+        out.update(refused=True, reason="A moved recurring occurrence needs explicit approval: either "
+                   "--allow-additional-run (the original slot ALSO runs) or --skip-original=experimental "
+                   "(experimental true skip; see README). Nothing was written.")
         return out
     if confirm:
-        out["writes"], out["errors"] = _apply(ops, cal)
+        writes, errors = _reconcile_skips(st, raw_jobs, decisions) if decisions else (0, [])
+        w2, e2 = _apply(ops, cal, st)
+        out["writes"], out["errors"] = writes + w2, errors + e2
         # Do not bless failed operations as a successful baseline.
         if not out["errors"]:
             _snapshot(cal)
     return out
+
+
+SKIP_EXPERIMENTAL_WARNING = (
+    "EXPERIMENTAL --skip-original: the source job is paused now and resumed 10 min after the original "
+    "slot, with grace_minutes=0 (and catch_up=false if it was true) until Hermes skips that slot; Hermes "
+    "books it as one 'missed' row in the cron execution ledger. Two one-shot wake-up jobs are created. "
+    "Any change to the job, or a manual pause/resume, aborts the skip.")
+
+
+def _reconcile_skips(st: Dict[str, Any], raw_jobs: list, decisions: List[Dict[str, Any]]):
+    cron = _cron_dispatcher()
+    live = {r["id"] for r in raw_jobs if r.get("state") not in {"completed", "error"}}
+    by_id = {r["id"]: r for r in raw_jobs}
+    writes, errors = 0, []
+    for d in decisions:
+        rec = st["occurrences"][d["occurrence"]]
+        try:
+            skip.execute(cron, _check, rec, by_id.get(rec.get("source_job_id")), d["actions"], live)
+            writes += sum(a in {"restore", "resume"} for a in d["actions"])
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"skip": d, "error": f"{type(exc).__name__}: {exc}"})
+        _save_state(st)
+    return writes, errors
+
+
+def skip_tick(quiet: bool = False) -> Dict[str, Any]:
+    """Run by the wake-up jobs (and safe to run by hand): advance experimental skips. Cron only."""
+    st = _load_state()
+    raw_jobs = _raw_jobs()
+    _refresh_occurrences(st, raw_jobs)
+    decisions = _skip_decisions(st["occurrences"], raw_jobs)
+    writes, errors = _reconcile_skips(st, raw_jobs, decisions) if decisions else (0, [])
+    _save_state(st)
+    res = {"writes": writes, "errors": errors, "warnings": [w for d in decisions for w in d["warnings"]]}
+    if not quiet:
+        res["decisions"] = decisions
+    return res
+
+
+def _install_skip_script() -> str:
+    import shutil
+    hermes = shutil.which("hermes") or str(Path.home() / ".local" / "bin" / "hermes")
+    d = _home() / "scripts"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / skip.SCRIPT_NAME).write_text(skip.SCRIPT.replace("{hermes!r}", repr(hermes)), encoding="utf-8")
+    return skip.SCRIPT_NAME
 
 
 CRON_TOOL = "cronjob_manage"  # registered name in tools/cronjob_tools.py
@@ -279,14 +400,15 @@ def _cron_dispatcher():
     return lambda args: ctx.dispatch_tool(CRON_TOOL, args)
 
 
-def _apply(ops: List[Dict[str, Any]], calendar_id: str):
+def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, Any]] = None):
     from .gcal import Calendar
     needs_cron = any(o["direction"] == "calendar->cron" for o in ops)
     # Preflight before ANY write so a missing cron tool cannot leave calendar-only partial syncs.
     cron = _cron_dispatcher() if needs_cron else None
     gc, writes, errors = Calendar(calendar_id), 0, []
-    st = _load_state()
+    st = st if st is not None else _load_state()
     links = st.setdefault("jobs", {})
+    recs = st.setdefault("occurrences", {})
     for op in ops:
         a, jid = op["action"], op["job_id"]
         try:
@@ -307,21 +429,28 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str):
                 upd = {k: v for k, v in op["updates"].items() if k in CRON_FIELDS}
                 _check(cron({"action": "update", "job_id": jid, **upd}))
             elif a == "pause_job":
-                _check(cron({"action": "pause", "job_id": jid,
-                                               "reason": "hermes-jobs: calendar event deleted"}))
+                _check(cron({"action": "pause", "job_id": jid, "reason": planner.DELETE_MARKER}))
                 links.setdefault(jid, {}).update(paused_by_delete=True, event_id=None,
                                                  pause_reason=planner.pause_message(jid))
                 _save_state(st)
             elif a in {"create_once", "finish_move"}:
                 if a == "create_once":
                     # Journal intent before creating: a crash with unknown result must not duplicate.
+                    key = op["occurrence"]
                     links.setdefault(jid, {})["move_intent"] = op["event_id"]
+                    recs[key] = {"key": key, "source_job_id": jid, "original_slot": op["original_slot"],
+                                 "moved_start": op["moved_start"], "event_id": op["event_id"],
+                                 "fingerprint": op["fingerprint"], "mode": op.get("mode", "additional"),
+                                 "status": "pending", "child_id": None}
                     _save_state(st)
-                    result = _check(cron({"action": "create", **op["create_args"]}))
-                    writes += 1  # cron creation and event ownership patch are separate writes
-                    child = result.get("job_id")
+                    child = _find_copy(op["create_args"]["name"], op["moved_start"])
+                    if not child:  # adopt a copy an interrupted earlier attempt already created
+                        result = _check(cron({"action": "create", **op["create_args"]}))
+                        writes += 1  # cron creation and event ownership patch are separate writes
+                        child = result.get("job_id")
                     if not child:
                         raise RuntimeError("create returned no job_id; reconcile move_intent manually before retry")
+                    recs[key]["child_id"] = child
                     links[child] = {"source_job_id": jid, "event_id": op["event_id"],
                                     "original_slot": op["original_slot"]}
                     links[jid].update(pending_move={"child_id": child, "event_id": op["event_id"],
@@ -329,15 +458,46 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str):
                                                    "original_slot": op["original_slot"], "board_start": op["board_start"]})
                     links[jid].pop("move_intent", None)
                     _save_state(st)
+                    if recs[key]["mode"] == "skip":
+                        raw = next(r for r in _raw_jobs() if r["id"] == jid)
+                        why = skip.eligibility(raw, op["original_slot"], _now())
+                        if why or planner.fingerprint(_view(raw)) != op["fingerprint"]:
+                            recs[key]["mode"] = "additional"
+                            errors.append({"op": op, "error": "experimental skip NOT armed (" + (why or "job changed")
+                                           + "); the copy exists and the original slot WILL also run"})
+                        else:
+                            recs[key]["phase"] = "arming"
+                            skip.arm(cron, _check, recs[key], raw, lambda: _save_state(st), _install_skip_script)
+                            writes += 3
                 pending = links[jid]["pending_move"]
                 child = pending["child_id"]
                 child_job = next(j for j in _crons() if j["id"] == child)
-                body = planner.event_body(child_job)
+                body = planner.event_body(child_job, {"hermes_source_job_id": jid,
+                                                      "hermes_original_slot": planner.utc_instant(pending["original_slot"])})
                 body["start"] = pending["moved_start"]
+                body = planner.with_occurrence(child, body)
                 gc.patch(pending["event_id"], body)
                 links[child].update(job_hash=planner.job_hash(child_job), start=body["start"], summary=body["summary"])
                 links[jid].update(original_slot=pending["original_slot"], board_start=pending["board_start"], event_id=None)
                 links[jid].pop("pending_move", None)
+                _save_state(st)
+            elif a == "drop_move":
+                rec = recs[op["occurrence"]]
+                raws = {r["id"]: r for r in _raw_jobs()}
+                live = {i for i, r in raws.items() if r.get("state") not in {"completed", "error"}}
+                if rec.get("mode") == "skip" and rec.get("phase") not in {"done", "aborted"}:
+                    src = raws.get(jid)
+                    undo = ["restore"] + (["resume"] if src and skip._ours(src, rec["key"]) else []) + ["cleanup", "abort"]
+                    skip.execute(cron, _check, rec, src, undo, live)
+                if rec.get("child_id") in live:
+                    _check(cron({"action": "remove", "job_id": rec["child_id"]}))
+                if rec.get("event_id"):
+                    gc.delete(rec["event_id"])
+                rec["status"] = "dropped"
+                links.pop(rec.get("child_id"), None)
+                links.setdefault(jid, {}).update(event_id=None)
+                links[jid].pop("original_slot", None)
+                links[jid].pop("board_start", None)
                 _save_state(st)
             elif a == "forget":
                 links.pop(jid, None)
@@ -348,6 +508,15 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str):
         except Exception as exc:  # noqa: BLE001
             errors.append({"op": op, "error": f"{type(exc).__name__}: {exc}"})
     return writes, errors
+
+
+def _find_copy(name: str, moved_start: str) -> Optional[str]:
+    for raw in _raw_jobs():
+        sched = raw.get("schedule") or {}
+        if (raw.get("name") == name and sched.get("kind") == "once"
+                and planner.instant(sched.get("run_at")) == planner.instant(moved_start)):
+            return raw["id"]
+    return None
 
 
 def _check(result) -> dict:
@@ -362,8 +531,10 @@ def _check(result) -> dict:
 def _snapshot(calendar_id: str) -> None:
     """Record what is now on both sides so the next run can tell who moved what."""
     jobs = {j["id"]: j for j in _crons()}
-    old = _load_state().get("jobs", {})
-    st = {"calendar_id": calendar_id, "jobs": {jid: dict(last) for jid, last in old.items() if jid in jobs}}
+    prev = _load_state()
+    old = prev.get("jobs", {})
+    st = {"calendar_id": calendar_id, "jobs": {jid: dict(last) for jid, last in old.items() if jid in jobs},
+          "occurrences": prev.get("occurrences", {})}
     for jid, last in st["jobs"].items():
         if last.get("original_slot") and jobs[jid].get("start") != last["original_slot"]:
             last.pop("original_slot", None)
@@ -371,8 +542,11 @@ def _snapshot(calendar_id: str) -> None:
     for ev in _events(calendar_id, False):
         j = jobs.get(ev["hermes_job_id"])
         if j:
-            st["jobs"].setdefault(j["id"], {}).update(event_id=ev["id"], job_hash=planner.job_hash(j),
-                                                        start=ev["start"], summary=ev["summary"])
+            entry = st["jobs"].setdefault(j["id"], {})
+            entry.update(event_id=ev["id"], job_hash=planner.job_hash(j), start=ev["start"], summary=ev["summary"])
+            props = ev.get("props") or {}
+            if props.get("hermes_source_job_id") and not entry.get("source_job_id"):
+                entry["source_job_id"] = props["hermes_source_job_id"]  # rebuilt from the event's own tags
     _save_state(st)
 
 
@@ -381,7 +555,13 @@ def _cli(args) -> None:
     if cmd == "bind":
         res = bind(args.calendar)
     elif cmd == "sync":
-        res = sync(args.confirm, args.offline, args.allow_additional_run)
+        res = sync(args.confirm, args.offline, args.allow_additional_run, args.skip_original)
+    elif cmd == "skip-tick":
+        res = skip_tick(args.quiet)
+        if args.quiet:
+            if res["warnings"] or res["errors"]:
+                print(json.dumps({k: res[k] for k in ("warnings", "errors")}, default=str))
+            return
     else:
         res = {"discover": discover, "status": status}[cmd]()
     print(json.dumps(res, indent=2, default=str))
@@ -396,6 +576,10 @@ def _setup(p) -> None:
     s = sub.add_parser("sync", help="Plan both directions; dry-run unless --confirm")
     s.add_argument("--confirm", action="store_true", help="Apply the plan (cron + calendar writes)")
     s.add_argument("--allow-additional-run", action="store_true", help="Accept that a moved recurring occurrence ALSO runs at its original slot (requires --confirm)")
+    s.add_argument("--skip-original", choices=["experimental"], default=None,
+                   help="EXPERIMENTAL: truly skip a moved occurrence's original slot (pause/resume; books a 'missed' ledger row)")
+    t = sub.add_parser("skip-tick", help="Advance pending experimental skips (run by their wake-up jobs)")
+    t.add_argument("--quiet", action="store_true")
     s.add_argument("--offline", action="store_true", help="Plan against an empty calendar; no Google calls")
 
 

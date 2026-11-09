@@ -100,7 +100,10 @@ class PlannerTest(unittest.TestCase):
     def test_cron_advance_moves_event(self):
         ops = P.plan([job(start=T11)], [ev()], synced(job(start=T11)))
         self.assertEqual(actions(ops), [("cron->calendar", "patch_event")])
-        self.assertEqual(ops[0]["event"], {"start": T11})
+        self.assertEqual(ops[0]["event"]["start"], T11)
+        self.assertEqual(ops[0]["event"]["hermes_job_id"], "j1")  # full private set: tag never stripped
+        self.assertEqual(ops[0]["event"]["props"]["hermes_occurrence"], P.occurrence_key("j1", T11))
+        self.assertEqual(ops[0]["event_id"], "e1")  # patch-forward keeps the event id
 
     def test_job_without_next_run_gets_no_event(self):
         self.assertEqual(P.plan([job(start=None)], [], {}), [])
@@ -137,9 +140,9 @@ class PlannerTest(unittest.TestCase):
         ops = P.plan([job()], [ev(start=T10)], synced(pending_move={"child_id": "c"}))
         self.assertEqual(ops[0]["action"], "finish_move")
 
-    def test_uncertain_create_blocks_retry(self):
+    def test_uncertain_create_replans_for_idempotent_adoption(self):
         ops = P.plan([job()], [ev(start=T10)], synced(move_intent="e1"))
-        self.assertEqual(ops[0]["action"], "notice")
+        self.assertEqual(ops[0]["action"], "create_once")  # apply adopts an existing copy first
 
     def test_source_board_previews_following_slot(self):
         ops = P.plan([job()], [], synced(event_id=None, original_slot=T9, board_start=T11))
