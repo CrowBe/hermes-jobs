@@ -27,7 +27,10 @@ class RuntimeTest(unittest.TestCase):
         self.events = []
         self.cal = MagicMock()
         self.dispatch = MagicMock(return_value=json.dumps({"success": True}))
-        M._CTX["ctx"] = types.SimpleNamespace(dispatch_tool=self.dispatch)
+        M._CTX["ctx"] = types.SimpleNamespace(dispatch_tool=lambda name, args: self.dispatch(name, args))
+        self.registry_patch = patch.object(M, "_cron_dispatcher", side_effect=lambda: (lambda args: M._CTX["ctx"].dispatch_tool(M.CRON_TOOL, args)))
+        self.registry_patch.start()
+        self.addCleanup(self.registry_patch.stop)
         self.patches = [patch.object(M, "_crons", side_effect=lambda: self.jobs),
                         patch.object(M, "_events", side_effect=lambda *_: self.events),
                         patch(M.__name__ + ".gcal.Calendar", return_value=self.cal)]
@@ -149,3 +152,33 @@ class RuntimeTest(unittest.TestCase):
         self.patches[1].stop()
         self.assertEqual(M._events("test-calendar", True), [])
         self.cal.list_tagged.assert_not_called()
+
+
+class DispatchPathTest(unittest.TestCase):
+    """Real _cron_dispatcher: empty CLI registry is populated, then cronjob_manage is dispatched."""
+
+    def test_cli_registry_discovery_then_named_dispatch(self):
+        entries = {}
+        fake_registry = types.SimpleNamespace(get_entry=lambda name, **_: entries.get(name))
+        discover = MagicMock(side_effect=lambda: entries.update(cronjob_manage=object()))
+        fake_mod = types.SimpleNamespace(registry=fake_registry, discover_builtin_tools=discover)
+        calls = []
+        M._CTX["ctx"] = types.SimpleNamespace(dispatch_tool=lambda name, args: calls.append((name, args)) or "{}")
+        with patch.dict(sys.modules, {"tools.registry": fake_mod}):
+            cron = M._cron_dispatcher()
+            cron({"action": "pause", "job_id": "j1", "reason": "r"})
+        discover.assert_called_once()
+        self.assertEqual(calls, [("cronjob_manage", {"action": "pause", "job_id": "j1", "reason": "r"})])
+
+    def test_missing_tool_fails_before_any_calendar_write(self):
+        fake_registry = types.SimpleNamespace(get_entry=lambda name, **_: None)
+        fake_mod = types.SimpleNamespace(registry=fake_registry, discover_builtin_tools=lambda: None)
+        cal = MagicMock()
+        M._CTX["ctx"] = types.SimpleNamespace(dispatch_tool=MagicMock())
+        ops = [{"direction": "cron->calendar", "action": "insert_event", "job_id": "x", "event": {}},
+               {"direction": "calendar->cron", "action": "pause_job", "job_id": "j1", "reason": "r"}]
+        with patch.dict(sys.modules, {"tools.registry": fake_mod}), \
+                patch(M.__name__ + ".gcal.Calendar", return_value=cal):
+            with self.assertRaises(RuntimeError):
+                M._apply(ops, "cal")
+        cal.insert.assert_not_called()

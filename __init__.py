@@ -259,9 +259,31 @@ def sync(confirm: bool = False, offline: bool = False, allow_additional_run: boo
     return out
 
 
+CRON_TOOL = "cronjob_manage"  # registered name in tools/cronjob_tools.py
+
+
+def _cron_dispatcher():
+    """Return a caller for Hermes' own cron tool via the documented ctx.dispatch_tool seam.
+
+    A `hermes <plugin-command>` CLI process never imports model_tools, so the built-in tool
+    registry is empty there and dispatch_tool answered "Unknown tool: cronjob_manage". Populate
+    it with the public tools.registry discovery entry point (the same call model_tools makes)
+    before dispatching; agent/gateway processes already have it and skip discovery.
+    """
+    from tools.registry import discover_builtin_tools, registry
+    if registry.get_entry(CRON_TOOL) is None:
+        discover_builtin_tools()
+    if registry.get_entry(CRON_TOOL) is None:
+        raise RuntimeError(f"Hermes tool {CRON_TOOL!r} is unavailable; refusing to apply cron ops")
+    ctx = _CTX["ctx"]
+    return lambda args: ctx.dispatch_tool(CRON_TOOL, args)
+
+
 def _apply(ops: List[Dict[str, Any]], calendar_id: str):
     from .gcal import Calendar
-    cron = _CTX["ctx"].dispatch_tool  # public seam: Hermes' own cronjob_manage tool
+    needs_cron = any(o["direction"] == "calendar->cron" for o in ops)
+    # Preflight before ANY write so a missing cron tool cannot leave calendar-only partial syncs.
+    cron = _cron_dispatcher() if needs_cron else None
     gc, writes, errors = Calendar(calendar_id), 0, []
     st = _load_state()
     links = st.setdefault("jobs", {})
@@ -283,9 +305,9 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str):
                     _save_state(st)
             elif a == "update_job":
                 upd = {k: v for k, v in op["updates"].items() if k in CRON_FIELDS}
-                _check(cron("cronjob_manage", {"action": "update", "job_id": jid, **upd}))
+                _check(cron({"action": "update", "job_id": jid, **upd}))
             elif a == "pause_job":
-                _check(cron("cronjob_manage", {"action": "pause", "job_id": jid,
+                _check(cron({"action": "pause", "job_id": jid,
                                                "reason": "hermes-jobs: calendar event deleted"}))
                 links.setdefault(jid, {}).update(paused_by_delete=True, event_id=None,
                                                  pause_reason=planner.pause_message(jid))
@@ -295,7 +317,7 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str):
                     # Journal intent before creating: a crash with unknown result must not duplicate.
                     links.setdefault(jid, {})["move_intent"] = op["event_id"]
                     _save_state(st)
-                    result = _check(cron("cronjob_manage", {"action": "create", **op["create_args"]}))
+                    result = _check(cron({"action": "create", **op["create_args"]}))
                     writes += 1  # cron creation and event ownership patch are separate writes
                     child = result.get("job_id")
                     if not child:
