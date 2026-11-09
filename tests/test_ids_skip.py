@@ -99,7 +99,7 @@ class SkipDecisionTest(unittest.TestCase):
         self.assertIsNone(S.eligibility(raw(), SLOT, NOW))
         self.assertIn("cron-expression", S.eligibility(raw(schedule={"kind": "interval", "minutes": 60}), SLOT, NOW))
         self.assertIn("paused", S.eligibility(raw(state="paused"), SLOT, NOW))
-        self.assertIn("no longer", S.eligibility(raw(next_run_at=T11), SLOT, NOW))
+        self.assertIn("not the job's next run", S.eligibility(raw(next_run_at=T11), SLOT, NOW))
         self.assertIn("too late", S.eligibility(raw(), SLOT, self.at(-3)))
 
     def test_waits_until_after_grace_then_resumes(self):

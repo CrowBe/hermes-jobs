@@ -59,7 +59,7 @@ def eligibility(raw: Dict[str, Any], slot: str, now: datetime) -> Optional[str]:
     if not raw.get("enabled", True) or raw.get("state") == "paused":
         return "source job is paused; nothing to skip"
     if not raw.get("next_run_at") or planner.instant(raw["next_run_at"]) != planner.instant(slot):
-        return "source next_run_at no longer equals the moved occurrence; re-run the dry-run"
+        return "the original slot is not the job's next run (experimental skip handles only the next occurrence); re-run the dry-run"
     if _dt(slot) - now < MIN_LEAD:
         return f"original slot is less than {int(MIN_LEAD.total_seconds() // 60)} min away; too late to arm safely"
     return None

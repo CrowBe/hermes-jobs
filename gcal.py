@@ -40,14 +40,38 @@ class Calendar:
         self.base = f"{API}/calendars/{quote(calendar_id, safe='')}/events"
 
     def list_tagged(self) -> List[Dict[str, Any]]:
-        """Events carrying our private tag (filtered client-side; untagged events are dropped)."""
+        """Masters, singles and exceptions (singleEvents=false, showDeleted=true).
+
+        Untagged items are kept ONLY as possible "this and following" splits of our own series
+        (Google names them <master id>_R<date> and may not copy our tags); the planner ties them to
+        a job strictly by that id prefix and otherwise ignores them. Cancelled items are kept so
+        deleted masters and deleted single instances are visible.
+        """
         out, token = [], None
         while True:
-            q: Dict[str, Any] = {"maxResults": 250}
+            q: Dict[str, Any] = {"maxResults": 250, "singleEvents": "false", "showDeleted": "true"}
             if token:
                 q["pageToken"] = token
             data = _req("GET", f"{self.base}?{urlencode(q)}") or {}
-            out += [e for e in map(from_google, data.get("items", [])) if e["hermes_job_id"]]
+            out += [e for e in map(from_google, data.get("items", []))
+                    if e["hermes_job_id"] or e["recurring_event_id"] or "_R" in (e["id"] or "")]
+            token = data.get("nextPageToken")
+            if not token:
+                return out
+
+    def exceptions(self, master_id: str, time_min: str, time_max: str) -> List[Dict[str, Any]]:
+        """Moved or cancelled instances of one master in a window (authoritative per-master view)."""
+        out, token = [], None
+        while True:
+            q: Dict[str, Any] = {"maxResults": 250, "showDeleted": "true", "timeMin": time_min, "timeMax": time_max}
+            if token:
+                q["pageToken"] = token
+            data = _req("GET", f"{self.base}/{quote(master_id, safe='')}/instances?{urlencode(q)}") or {}
+            for e in map(from_google, data.get("items", [])):
+                e["recurring_event_id"] = e["recurring_event_id"] or master_id
+                if e["status"] == "cancelled" or (e["original_start"] and e["start"]
+                                                  and _same(e["start"], e["original_start"]) is False):
+                    out.append(e)
             token = data.get("nextPageToken")
             if not token:
                 return out
@@ -77,6 +101,10 @@ class Calendar:
         _req("DELETE", f"{self.base}/{quote(event_id, safe='')}")
 
 
+def _same(a: str, b: str) -> bool:
+    return datetime.fromisoformat(a.replace("Z", "+00:00")) == datetime.fromisoformat(b.replace("Z", "+00:00"))
+
+
 def to_google(ev: Dict[str, Any]) -> Dict[str, Any]:
     g: Dict[str, Any] = {k: ev[k] for k in ("summary", "description") if k in ev}
     if ev.get("id"):
@@ -85,6 +113,10 @@ def to_google(ev: Dict[str, Any]) -> Dict[str, Any]:
         start = datetime.fromisoformat(ev["start"])
         g["start"] = {"dateTime": start.isoformat()}
         g["end"] = {"dateTime": (start + timedelta(minutes=MINUTES)).isoformat()}
+        if ev.get("tz"):  # recurring events need an IANA zone so the RRULE expands on its wall clock
+            g["start"]["timeZone"] = g["end"]["timeZone"] = ev["tz"]
+    if "recurrence" in ev:
+        g["recurrence"] = list(ev["recurrence"] or [])  # [] turns a master back into a single event
     if ev.get("hermes_job_id"):
         # Always write the FULL private set so PATCH can never strip the job tag.
         g["extendedProperties"] = {"private": {**(ev.get("props") or {}), TAG: ev["hermes_job_id"]}}
@@ -92,10 +124,16 @@ def to_google(ev: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def from_google(g: Dict[str, Any]) -> Dict[str, Any]:
-    if g.get("status") == "cancelled":
-        return {"id": g.get("id"), "hermes_job_id": None}
     private = (g.get("extendedProperties") or {}).get("private") or {}
+    common = {"status": g.get("status") or "confirmed", "recurring_event_id": g.get("recurringEventId"),
+              "original_start": (g.get("originalStartTime") or {}).get("dateTime"),
+              "recurrence": g.get("recurrence"), "tz": (g.get("start") or {}).get("timeZone")}
+    if g.get("status") == "cancelled":
+        # Cancelled masters/singles read as gone; cancelled instances keep their identity.
+        return {"id": g.get("id"), "hermes_job_id": None, "props": {}, "summary": None,
+                "description": None, "start": None, **common}
     return {
+        **common,
         "id": g.get("id"),
         "props": {k: v for k, v in private.items() if k != TAG},
         "summary": g.get("summary"),

@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import planner, skip
+from . import board, planner, rrule, skip
 
 SCOPE = "https://www.googleapis.com/auth/calendar.events"
 AUTH_HINT = "hermes auth add hermes-jobs:google"
@@ -138,6 +138,13 @@ def _view(raw: dict) -> dict:
          "schedule": raw.get("schedule_display") or sched.get("display") or sched,
          "schedule_kind": sched.get("kind"), "enabled": not paused or paused_by == "skip",
          "paused_by": paused_by, "terminal": raw.get("state") in {"completed", "error"}, "start": start}
+    if sched.get("kind") == "cron" and sched.get("expr"):
+        j["cron_expr"] = sched["expr"]
+        try:
+            j["tz"] = _job_zone(raw).key
+            j["rrule"], j["rrule_refusal"] = rrule.cron_to_rrule(sched["expr"], j["tz"])
+        except Exception as exc:  # noqa: BLE001 -- no zone, bad expr: stay on single events
+            j["rrule"], j["rrule_refusal"] = None, str(exc)
     try:
         j["copy_args"] = _copy_args(raw)
         if start and sched.get("kind") in {"cron", "interval"}:
@@ -209,8 +216,39 @@ _CTX: Dict[str, Any] = {}
 def _events(calendar_id: Optional[str], offline: bool) -> List[Dict[str, Any]]:
     if offline or not calendar_id:
         return []
+    from datetime import timedelta
     from .gcal import Calendar
-    return Calendar(calendar_id).list_tagged()
+    cal = Calendar(calendar_id)
+    events = cal.list_tagged()
+    # Per-master instances view: the authoritative list of moved/cancelled single runs.
+    seen = {e["id"] for e in events}
+    now = _now()
+    lo, hi = (now - timedelta(days=1)).isoformat(), (now + timedelta(days=EXCEPTION_WINDOW_DAYS)).isoformat()
+    for m in [e for e in events if e.get("hermes_job_id") and board.is_master(e) and not board.is_history(e)]:
+        for x in cal.exceptions(m["id"], lo, hi):
+            if x["id"] not in seen:
+                seen.add(x["id"])
+                events.append(x)
+    return events
+
+
+EXCEPTION_WINDOW_DAYS = 60
+
+
+def _mode(st: Dict[str, Any]) -> str:
+    return st.get("event_mode") or "recurring"
+
+
+def mode(new: Optional[str] = None) -> Dict[str, Any]:
+    """Event mode: 'recurring' (default) or 'single' (the hard fallback). Local state only; the
+    next confirmed sync converts masters <-> single events (dry-run shows convert_to_* ops)."""
+    st = _load_state()
+    if new:
+        if new not in {"recurring", "single"}:
+            return {"refused": True, "reason": "mode is 'recurring' or 'single'"}
+        st["event_mode"] = new
+        _save_state(st)
+    return {"event_mode": _mode(st), "next": "hermes hermes-jobs sync   (dry-run shows the conversion ops)"}
 
 
 def discover() -> Dict[str, Any]:
@@ -265,6 +303,9 @@ def _refresh_occurrences(st: Dict[str, Any], raw_jobs: list) -> Dict[str, Any]:
             child = by_id.get(rec["child_id"])
             if child is None or child.get("state") in {"completed", "error"}:
                 rec["status"] = "fired" if child else "gone"
+        elif rec.get("status") == "pending" and not rec.get("child_id") and rec.get("mode") == "skip" \
+                and rec.get("phase") in {"done", "aborted"}:
+            rec["status"] = rec["phase"]  # skip-only record (deleted instance) finished
     return recs
 
 
@@ -297,9 +338,19 @@ def sync(confirm: bool = False, offline: bool = False, allow_additional_run: boo
         return {"error": f"{type(exc).__name__}: {exc}", "sign_in": AUTH_HINT, "writes": 0}
     recs = {} if offline else _refresh_occurrences(st, raw_jobs)
     decisions = _skip_decisions(recs, raw_jobs)
-    ops = planner.plan(jobs, events, {} if offline else st.get("jobs", {}), recs)
+    ops = board.plan(jobs, events, {} if offline else st.get("jobs", {}), recs, recurring=_mode(st) == "recurring")
     raw_by_id = {r["id"]: r for r in raw_jobs}
     for op in ops:
+        if op["action"] == "skip_instance":
+            why = (skip.eligibility(raw_by_id[op["job_id"]], op["original_slot"], _now())
+                   if skip_original == "experimental" else None)
+            if skip_original != "experimental" or why:
+                op.update(action="notice", reason=f"{op['reason']}: can't skip a single run"
+                          + (f" ({why})" if why else " (only with --skip-original=experimental)")
+                          + "; nothing changed -- that run WILL still happen")
+            else:
+                op.update(mode="skip", skip_steps=skip.steps(op["original_slot"]), warning=SKIP_EXPERIMENTAL_WARNING)
+            continue
         if op["action"] != "create_once":
             continue
         op["mode"] = "additional"
@@ -310,6 +361,7 @@ def sync(confirm: bool = False, offline: bool = False, allow_additional_run: boo
             else:
                 op.update(mode="skip", skip_steps=skip.steps(op["original_slot"]), warning=SKIP_EXPERIMENTAL_WARNING)
     out: Dict[str, Any] = {"dry_run": not confirm, "calendar_id": cal, "offline": offline or not cal,
+                           "event_mode": _mode(st),
                            "events_seen": len(events), "ops": ops, "writes": 0,
                            "messages": [o["reason"] for o in ops if o["action"] in {"pause_job", "notice"}]
                            + [f"experimental skip refused for {o['job_id']}: {o['skip_refused']}"
@@ -418,8 +470,40 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                 links[jid].update(event_id=ev["id"], job_hash=planner.job_hash(next(j for j in _crons() if j["id"] == jid)),
                                   start=ev["start"], summary=ev["summary"])
                 _save_state(st)
-            elif a == "patch_event":
+            elif a in {"patch_event", "convert_to_recurring", "convert_to_single"}:
                 gc.patch(op["event_id"], op["event"])
+                if a != "patch_event" or "recurrence" in op["event"]:
+                    links.setdefault(jid, {}).pop("split_pending", None)
+                    _save_state(st)
+            elif a == "adopt_split":
+                gc.patch(op["series_id"], op["event"])  # tags only; Google's own start/RRULE kept
+                entry = links.setdefault(jid, {})
+                entry["history_ids"] = sorted(set(entry.get("history_ids") or []) | {op["old_id"]})
+                entry["event_id"] = op["series_id"]
+                _save_state(st)
+                if op.get("cron"):
+                    if op["cron_now"]:
+                        _check(cron({"action": "update", "job_id": jid, "schedule": op["cron"]}))
+                    else:
+                        entry["split_pending"] = {"cron": op["cron"], "until": op["until"]}
+                        _save_state(st)
+            elif a == "apply_split":
+                _check(cron({"action": "update", "job_id": jid, "schedule": op["updates"]["schedule"]}))
+                links.setdefault(jid, {}).pop("split_pending", None)
+                _save_state(st)
+            elif a == "skip_instance":
+                key = op["occurrence"]
+                raw = next(r for r in _raw_jobs() if r["id"] == jid)
+                why = skip.eligibility(raw, op["original_slot"], _now())
+                if why or planner.fingerprint(_view(raw)) != op["fingerprint"]:
+                    errors.append({"op": op, "error": "experimental skip NOT armed (" + (why or "job changed")
+                                   + "); the run WILL happen"})
+                    continue
+                recs[key] = {"key": key, "source_job_id": jid, "original_slot": op["original_slot"],
+                             "moved_start": None, "event_id": op["event_id"], "fingerprint": op["fingerprint"],
+                             "mode": "skip", "status": "pending", "child_id": None, "instance_backed": True}
+                skip.arm(cron, _check, recs[key], raw, lambda: _save_state(st), _install_skip_script)
+                writes += 3
             elif a == "delete_event":
                 gc.delete(op["event_id"])
                 if jid in links:
@@ -428,10 +512,15 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
             elif a == "update_job":
                 upd = {k: v for k, v in op["updates"].items() if k in CRON_FIELDS}
                 _check(cron({"action": "update", "job_id": jid, **upd}))
+                if op.get("occurrence") in recs and op.get("moved_start"):
+                    recs[op["occurrence"]]["moved_start"] = op["moved_start"]  # re-moved instance copy
+                    _save_state(st)
             elif a == "pause_job":
                 _check(cron({"action": "pause", "job_id": jid, "reason": planner.DELETE_MARKER}))
                 links.setdefault(jid, {}).update(paused_by_delete=True, event_id=None,
                                                  pause_reason=planner.pause_message(jid))
+                if op.get("occurrence") in recs:
+                    recs[op["occurrence"]]["child_paused"] = True
                 _save_state(st)
             elif a in {"create_once", "finish_move"}:
                 if a == "create_once":
@@ -441,7 +530,9 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                     recs[key] = {"key": key, "source_job_id": jid, "original_slot": op["original_slot"],
                                  "moved_start": op["moved_start"], "event_id": op["event_id"],
                                  "fingerprint": op["fingerprint"], "mode": op.get("mode", "additional"),
-                                 "status": "pending", "child_id": None}
+                                 "status": "pending", "child_id": None,
+                                 "instance_backed": bool(op.get("instance_backed")),
+                                 "instance_event_id": op["event_id"] if op.get("instance_backed") else None}
                     _save_state(st)
                     child = _find_copy(op["create_args"]["name"], op["moved_start"])
                     if not child:  # adopt a copy an interrupted earlier attempt already created
@@ -451,6 +542,23 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                     if not child:
                         raise RuntimeError("create returned no job_id; reconcile move_intent manually before retry")
                     recs[key]["child_id"] = child
+                    if op.get("instance_backed"):
+                        # The Google exception IS the copy's board entry: no own event, no retag.
+                        links[child] = {"source_job_id": jid, "instance_backed": True,
+                                        "original_slot": op["original_slot"]}
+                        links[jid].pop("move_intent", None)
+                        _save_state(st)
+                        if recs[key]["mode"] == "skip":
+                            raw = next(r for r in _raw_jobs() if r["id"] == jid)
+                            why = skip.eligibility(raw, op["original_slot"], _now())
+                            if why or planner.fingerprint(_view(raw)) != op["fingerprint"]:
+                                recs[key]["mode"] = "additional"
+                                errors.append({"op": op, "error": "experimental skip NOT armed (" + (why or "job changed")
+                                               + "); the copy exists and the original slot WILL also run"})
+                            else:
+                                skip.arm(cron, _check, recs[key], raw, lambda: _save_state(st), _install_skip_script)
+                                writes += 3
+                        continue
                     links[child] = {"source_job_id": jid, "event_id": op["event_id"],
                                     "original_slot": op["original_slot"]}
                     links[jid].update(pending_move={"child_id": child, "event_id": op["event_id"],
@@ -491,8 +599,8 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                     skip.execute(cron, _check, rec, src, undo, live)
                 if rec.get("child_id") in live:
                     _check(cron({"action": "remove", "job_id": rec["child_id"]}))
-                if rec.get("event_id"):
-                    gc.delete(rec["event_id"])
+                if rec.get("event_id") and not rec.get("instance_backed"):
+                    gc.delete(rec["event_id"])  # never cancel a series instance; cron-wins re-patches the master
                 rec["status"] = "dropped"
                 links.pop(rec.get("child_id"), None)
                 links.setdefault(jid, {}).update(event_id=None)
@@ -539,14 +647,24 @@ def _snapshot(calendar_id: str) -> None:
         if last.get("original_slot") and jobs[jid].get("start") != last["original_slot"]:
             last.pop("original_slot", None)
             last.pop("board_start", None)
-    for ev in _events(calendar_id, False):
-        j = jobs.get(ev["hermes_job_id"])
-        if j:
-            entry = st["jobs"].setdefault(j["id"], {})
-            entry.update(event_id=ev["id"], job_hash=planner.job_hash(j), start=ev["start"], summary=ev["summary"])
-            props = ev.get("props") or {}
-            if props.get("hermes_source_job_id") and not entry.get("source_job_id"):
-                entry["source_job_id"] = props["hermes_source_job_id"]  # rebuilt from the event's own tags
+    events = _events(calendar_id, False)
+    series = [e for e in events if e.get("status") != "cancelled" and not e.get("recurring_event_id")]
+    for jid, j in jobs.items():
+        entry = st["jobs"].get(jid, {})
+        ev = board.choose_current(jid, entry, series)
+        if not ev:
+            continue
+        entry = st["jobs"].setdefault(jid, entry)
+        entry.update(event_id=ev["id"], job_hash=planner.job_hash(j), start=ev["start"], summary=ev["summary"])
+        if board.is_master(ev):
+            entry.update(kind="recurring", rrule=ev.get("recurrence"), tz=ev.get("tz"))
+        else:
+            entry.update(kind="single")
+            for k in ("rrule", "tz"):
+                entry.pop(k, None)
+        props = ev.get("props") or {}
+        if props.get("hermes_source_job_id") and not entry.get("source_job_id"):
+            entry["source_job_id"] = props["hermes_source_job_id"]  # rebuilt from the event's own tags
     _save_state(st)
 
 
@@ -556,6 +674,8 @@ def _cli(args) -> None:
         res = bind(args.calendar)
     elif cmd == "sync":
         res = sync(args.confirm, args.offline, args.allow_additional_run, args.skip_original)
+    elif cmd == "mode":
+        res = mode(args.mode)
     elif cmd == "skip-tick":
         res = skip_tick(args.quiet)
         if args.quiet:
@@ -578,6 +698,8 @@ def _setup(p) -> None:
     s.add_argument("--allow-additional-run", action="store_true", help="Accept that a moved recurring occurrence ALSO runs at its original slot (requires --confirm)")
     s.add_argument("--skip-original", choices=["experimental"], default=None,
                    help="EXPERIMENTAL: truly skip a moved occurrence's original slot (pause/resume; books a 'missed' ledger row)")
+    m = sub.add_parser("mode", help="Show or set event mode: recurring (default) or single (fallback)")
+    m.add_argument("mode", nargs="?", choices=["recurring", "single"])
     t = sub.add_parser("skip-tick", help="Advance pending experimental skips (run by their wake-up jobs)")
     t.add_argument("--quiet", action="store_true")
     s.add_argument("--offline", action="store_true", help="Plan against an empty calendar; no Google calls")

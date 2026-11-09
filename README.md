@@ -49,6 +49,7 @@ hermes hermes-jobs sync                  # dry-run against the bound calendar
 hermes hermes-jobs sync --confirm        # apply (human CLI step only; the agent tool can only plan)
 hermes hermes-jobs sync --skip-original=experimental            # dry-run incl. the experimental skip steps
 hermes hermes-jobs skip-tick             # advance pending experimental skips (run by their wake-up jobs)
+hermes hermes-jobs mode [recurring|single]   # show/set event mode (recurring = default; single = fallback)
 ```
 
 - cron -> calendar: one 15-min event per job at its next run, tagged `extendedProperties.private.hermes_job_id`;
@@ -91,6 +92,82 @@ hex. The namespace is a fixed literal and must never change. The instant is cano
 - **Existing events keep their Google-assigned ids** (the two live probe events). They are adopted
   by tag, and they pick up `hermes_occurrence` on their next patch-forward. Nothing is deleted or
   recreated to migrate them.
+
+### Recurring Google events (event mode `recurring`, the default)
+
+A cron job whose expression converts **exactly** to an RRULE is shown as ONE real Google recurring
+event (a master with `recurrence: [RRULE...]` and `start.timeZone` = the job's IANA zone). It is tagged
+like every other event (`hermes_job_id`, full private prop set), its id is the derived occurrence key
+of its first slot, and it is **not** patched forward (its DTSTART stays fixed; Google expands it).
+Everything else keeps the single patch-forward event above: one-shots, interval jobs, and any cron
+that does not convert.
+
+| cron (job zone Australia/Sydney) | RRULE | back to cron |
+| --- | --- | --- |
+| `0 9 * * *` | `FREQ=DAILY` | `0 9 * * *` |
+| `0 18 * * 1-5` | `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | `0 18 * * 1,2,3,4,5` |
+| `30 7 * * MON,WED,FRI` | `FREQ=WEEKLY;BYDAY=MO,WE,FR` | `30 7 * * 1,3,5` |
+| `0 9 1,15 * *` | `FREQ=MONTHLY;BYMONTHDAY=1,15` | `0 9 1,15 * *` |
+| `0 9 25 12 *` | `FREQ=YEARLY;BYMONTH=12;BYMONTHDAY=25` | `0 9 25 12 *` |
+| `0 9 * 6-8 *` | `FREQ=DAILY;BYMONTH=6,7,8` | `0 9 * 6,7,8 *` |
+| `0 9 * * 0,7` | `FREQ=WEEKLY;BYDAY=SU` | `0 9 * * 0` |
+| `0 2 * * *` | refused: 02:xx is skipped/repeated at a Sydney DST change | single event |
+| `*/5 * * * *`, `0 9,17 * * *`, `0 */2 * * *` | refused: more than one time per day | single event |
+| `0 9 1 * 1` | refused: cron ORs day-of-month with day-of-week; RRULE would AND them | single event |
+| Calendar `INTERVAL=2`, `COUNT`, `BYDAY=1MO`, `BYMONTHDAY=-1`, `BYHOUR` | no cron equivalent | refused, nothing changes |
+
+"Back to cron" is canonical numeric form (Sun = 0). A converted job's minute and hour must be single
+values, and the wall time must exist exactly once on every day for the next ~800 days in its zone.
+A `FREQ=WEEKLY` with no `BYDAY` takes its weekday from the event start.
+
+**Migration.** A job that already has a single event gets `convert_to_recurring`: the SAME event is
+patched (summary, description, tags, `start` = next run + `timeZone`, `recurrence`). No delete, no new
+id, no orphan. Like every write it appears in the dry-run first and needs `--confirm`.
+
+**Reading.** Events are listed with `singleEvents=false&showDeleted=true` (masters, singles, moved and
+cancelled instances), and each current master's `/instances?showDeleted=true` is read for the next 60
+days. Moved/cancelled instances are matched by `recurringEventId` + `originalStartTime`. Instances
+before the job's next run are history and ignored.
+
+What each Google edit does on the next sync (dry-run shows it; `--confirm` applies it):
+
+1. **"This event" (move one instance)** -> a one-shot copy at the new time, exactly as for single
+   events: `--confirm` refuses without `--allow-additional-run` (the original slot ALSO runs), or use
+   `--skip-original=experimental`. The series is unchanged. The moved instance itself *is* the copy's
+   calendar entry (no extra event, not retagged). Moving it again moves the copy; deleting it pauses the
+   copy (soft pause, as for any deleted event).
+2. **"All events" (change the series' time or rule)** -> the cron schedule follows **only if** the new
+   RRULE converts back cleanly (e.g. 09:00 -> 10:00 gives `0 10 * * *`; daily -> Mon/Wed gives
+   `0 9 * * 1,3`). Otherwise (or if the series' time zone changed) the sync reports it, refuses, and
+   changes nothing. Undo it in Calendar or edit the job in Hermes; cron wins on the next sync.
+3. **"This and following"** -> Google ends the old master with `UNTIL` and creates a new series, usually
+   with id `<old id>_R<date>`, sometimes without our tags. The plugin treats it as a series reschedule:
+   it adopts the new series (`adopt_split`: tags it, makes it the job's event), the cron takes the new
+   series' rule, and the old master stays untouched as history. It is never deleted, never becomes a
+   second job, and is never orphaned (state keeps it under `history_ids`). Only a series tied to ours is
+   accepted: tagged with this job id, or untagged with id prefix `<our master id>_R`. Untagged events are
+   otherwise still ignored. If the old series still has runs left (its UNTIL is after the job's next run),
+   the cron change is **deferred** (`split_pending`) until the first confirmed sync after the old series
+   ends, so the remaining old-rule runs still fire. A split that starts at the original start (only the
+   rule changed) is handled the same way, with an immediate cron change. If the new rule does not convert,
+   nothing is adopted and nothing changes. An `UNTIL` with no follow-on series is reported (cron jobs
+   cannot end on a date).
+4. **Delete one instance** -> Hermes cannot skip a single run. Without the flag the sync reports `can't
+   skip a single run ... nothing changed -- that run WILL still happen`. With
+   `--skip-original=experimental` it uses the experimental skip below (the next occurrence only; books
+   one "missed" ledger row). No copy is created.
+
+**Cron wins.** Editing the job in Hermes rewrites the master's start/RRULE (and drops pending move or
+skip work, as before). Deleting the whole series is the usual soft-delete pause; after
+`hermes cron resume <id>` the next confirmed sync recreates the master. A removed job's current master
+is deleted; history masters never are. If a cron edit makes the job non-convertible, its master is
+converted back to a single patch-forward event (`convert_to_single`).
+
+**Fallback (single events).** `hermes hermes-jobs mode single` switches the board back to single events
+for everything: the next confirmed sync converts each master into a single event in place (PATCH
+`recurrence: []`, `start` = next run; same id), and from then on the original single-event path runs
+unchanged (tests assert it plans identically to it). `mode recurring` switches back. Moved instances
+that already became one-shot copies stay as they are.
 
 ### Deleted events: pause and recovery
 
