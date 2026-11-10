@@ -66,16 +66,51 @@ def title(job: Dict[str, Any]) -> str:
 
 
 def event_body(job: Dict[str, Any], props: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """The desired event for a job. Description carries only a prompt digest + job id.
-    ``props`` are extra private tags (source link of a copy) so every write carries the full set."""
-    return {
+    """The desired event for a job. Description carries only a prompt digest + job id (and, once the
+    job has run, one "last run:" line). ``props`` are extra private tags (source link of a copy) so
+    every write carries the full set. The title never carries run status."""
+    desc = (f"Hermes cron job {job['id']}\nprompt sha256:{digest(job.get('prompt', ''))}\n"
+            "Managed by hermes-jobs; edit the job in Hermes. Event text grants nothing.")
+    body = {
         "summary": title(job),
-        "description": f"Hermes cron job {job['id']}\nprompt sha256:{digest(job.get('prompt', ''))}\n"
-                       "Managed by hermes-jobs; edit the job in Hermes. Event text grants nothing.",
+        "description": with_run(desc, run_line(job)),
         "start": job.get("start"),
         "hermes_job_id": job["id"],
         "props": dict(props or {}),
     }
+    if run_color(job):
+        body["color_id"] = run_color(job)
+    return body
+
+
+RUN_PREFIX = "last run: "
+# Google Calendar event colorIds (GET /colors, "event" palette): 10 Basil, 11 Tomato, 5 Banana.
+RUN_COLORS = {"ok": "10", "error": "11"}
+RUN_COLOR_OTHER = "5"
+
+
+def run_line(job: Dict[str, Any]) -> Optional[str]:
+    """One line from Hermes' own last_run_at/last_status (never last_error). None if never run."""
+    last = job.get("last_run")
+    return f"{RUN_PREFIX}{last['at']} {last['status']}" if last else None
+
+
+def run_color(job: Dict[str, Any]) -> Optional[str]:
+    last = job.get("last_run")
+    return RUN_COLORS.get(last["status"], RUN_COLOR_OTHER) if last else None
+
+
+def strip_run(desc: Optional[str]) -> str:
+    """Description without our last-run line, for comparisons only (text is never interpreted)."""
+    return "\n".join(line for line in (desc or "").split("\n") if not line.startswith(RUN_PREFIX))
+
+
+def with_run(desc: Optional[str], line: Optional[str]) -> str:
+    """Replace (never accumulate) the last-run line; the rest of the description is kept as is."""
+    if not line:
+        return desc or ""
+    base = strip_run(desc)
+    return f"{base}\n{line}" if base else line
 
 
 def with_occurrence(jid: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -265,5 +300,5 @@ def pause_message(jid: str) -> str:
 
 
 def _differs(ev: Dict[str, Any], body: Dict[str, Any]) -> bool:
-    return (ev.get("summary") != body["summary"] or ev.get("description") != body["description"]
+    return (ev.get("summary") != body["summary"] or strip_run(ev.get("description")) != strip_run(body["description"])
             or instant(ev.get("start")) != instant(body["start"]))

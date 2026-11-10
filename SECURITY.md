@@ -21,7 +21,12 @@ made through Hermes' `credentialed_provider_request("google", ...)` with the OAu
   (15 minutes) with time zone; for recurring jobs the RRULE derived from the cron schedule; private
   extended properties: `hermes_job_id`, `hermes_occurrence` (an opaque uuid5 hex), and for one-shot
   copies `hermes_source_job_id` + `hermes_original_slot`. Event ids are derived uuid5 hex.
-- **Never sent**: the prompt text, skills, scripts, tool lists, delivery targets, model settings,
+- **Run outcome** (only after a job has run): its last-run time (Hermes `last_run_at`, in the job's
+  time zone) and status word (Hermes `last_status`, e.g. `ok`, `error`, `delivery_failed`) as one
+  `last run: <time> <status>` description line, plus the event `colorId` (10 for `ok`, 11 for `error`,
+  5 otherwise). Sent by `sync --confirm` as a `mark_run` op that shows in the dry run first. Hermes'
+  `last_error` text is never sent, and the title never changes.
+- **Never sent**: the prompt text, run error text, skills, scripts, tool lists, delivery targets, model settings,
   workdir, or anything else from the job's execution config.
 
 ## What comes back, and what it can change
@@ -29,7 +34,8 @@ made through Hermes' `credentialed_provider_request("google", ...)` with the OAu
 Calendar content is untrusted. It can only change a job's **name** (from a title: NFKC-normalised,
 control/format/bidi/zero-width characters removed, single line, at most 120 characters) and its
 **schedule** (a validated timezone-aware ISO instant for one-shots and moved copies, or a canonical
-cron built from integers when an RRULE converts exactly). Descriptions are compared, never parsed.
+cron built from integers when an RRULE converts exactly). Descriptions are compared, never parsed (only the plugin's own `last run:` line is recognised,
+to replace it).
 The dispatch gate (`_safe_updates`) drops every other field before `cronjob_manage` is called, for every
 calendar-derived update including the cron taken from a "this and following" split, so a
 calendar edit can never set a prompt, tools, a script, delivery, or reach a shell. Deleting events
@@ -53,6 +59,8 @@ only *pauses* jobs. Untagged events never create jobs.
   calendar id, event ids, job hashes, event titles/start times, occurrence records. No prompts, no tokens.
 - Reads (read-only): `<HERMES_HOME>/cron/jobs.json` and Hermes config (time zone).
 - Cron changes go only through Hermes' own `cronjob_manage` tool.
+- `/jobs` (slash command) and the `hermes_jobs_discover` tool are read-only: `/jobs` builds a dry-run
+  plan (Google reads only) and writes nothing to Google, cron or sync state.
 - Experimental skip only (`--skip-original=experimental`, off by default): writes the fixed script
   `<HERMES_HOME>/scripts/hermes-jobs-skip-tick.py` and creates two one-shot `no_agent` cron jobs that
   run `hermes hermes-jobs skip-tick --quiet` (fixed argument list, no shell, no input from Calendar).

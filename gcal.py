@@ -175,6 +175,8 @@ def to_google(ev: Dict[str, Any]) -> Dict[str, Any]:
         g["end"] = {"dateTime": (start + timedelta(minutes=MINUTES)).isoformat()}
         if ev.get("tz"):  # recurring events need an IANA zone so the RRULE expands on its wall clock
             g["start"]["timeZone"] = g["end"]["timeZone"] = ev["tz"]
+    if ev.get("color_id"):
+        g["colorId"] = ev["color_id"]
     if "recurrence" in ev:
         g["recurrence"] = list(ev["recurrence"] or [])  # [] turns a master back into a single event
     if ev.get("hermes_job_id"):
@@ -199,6 +201,7 @@ def from_google(g: Dict[str, Any]) -> Dict[str, Any]:
         "props": {k: v for k, v in private.items() if k != TAG},
         "summary": _text(g.get("summary"), 1024),
         "description": _text(g.get("description"), 8192),  # compared only, never interpreted
+        "color_id": _text(g.get("colorId"), 8),
         "start": instant((g.get("start") or {}).get("dateTime")),
         "hermes_job_id": ((g.get("extendedProperties") or {}).get("private") or {}).get(TAG),
     }

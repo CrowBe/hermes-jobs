@@ -146,6 +146,14 @@ def _view(raw: dict) -> dict:
             j["rrule"], j["rrule_refusal"] = rrule.cron_to_rrule(sched["expr"], j["tz"])
         except Exception as exc:  # noqa: BLE001 -- no zone, bad expr: stay on single events
             j["rrule"], j["rrule_refusal"] = None, str(exc)
+    if raw.get("last_run_at") and raw.get("last_status"):
+        try:  # Hermes' own run outcome (cron/jobs.py _record_run_outcome); last_error never leaves the box
+            from datetime import datetime
+            at = datetime.fromisoformat(str(raw["last_run_at"]).replace("Z", "+00:00")).astimezone(_job_zone(raw))
+            status = "".join(c for c in str(raw["last_status"]).lower() if c.isalpha() or c == "_")[:24]
+            j["last_run"] = {"at": at.strftime("%a %d %b %H:%M %Z"), "status": status or "unknown"}
+        except Exception:  # noqa: BLE001 -- unreadable stamp: show nothing rather than guess
+            pass
     try:
         j["copy_args"] = _copy_args(raw)
         if start and sched.get("kind") in {"cron", "interval"}:
@@ -485,6 +493,8 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                 links[jid].update(event_id=ev["id"], job_hash=planner.job_hash(next(j for j in _crons() if j["id"] == jid)),
                                   start=ev["start"], summary=ev["summary"])
                 _save_state(st)
+            elif a == "mark_run":
+                gc.patch(op["event_id"], op["event"])  # description + colorId only; no tags, title or time
             elif a in {"patch_event", "convert_to_recurring", "convert_to_single"}:
                 gc.patch(op["event_id"], op["event"])
                 if a != "patch_event" or "recurrence" in op["event"]:
@@ -782,6 +792,97 @@ def _setup(p) -> None:
     s.add_argument("--offline", action="store_true", help="Plan against an empty calendar; no Google calls")
 
 
+CONFIRM_COMMAND = "hermes hermes-jobs sync --confirm"
+AGENDA_DAYS = 7
+AGENDA_MAX = 40
+
+
+def _agenda(now) -> List[tuple]:
+    """Next AGENDA_DAYS of runs for enabled Hermes-owned jobs, from the cron store only."""
+    from datetime import timedelta
+    end, rows = (now + timedelta(days=AGENDA_DAYS)).timestamp(), []
+    for raw in _raw_jobs():
+        if _is_wake_job(raw):
+            continue
+        j = _view(raw)
+        at, n = j["start"], 0
+        if not j["enabled"] or j["terminal"]:
+            continue
+        while at and planner.instant(at) < end and n < AGENDA_MAX:
+            due = planner.instant(at) < now.timestamp()
+            rows.append((planner.instant(at), j.get("name") or j["id"], due))
+            n += 1
+            if j["schedule_kind"] not in {"cron", "interval"}:
+                break
+            try:  # an overdue stored slot is shown once, then the agenda continues from now
+                at = _following_start(raw, now.isoformat() if due else at)
+            except Exception:  # noqa: BLE001
+                break
+    return sorted(rows)
+
+
+def _waiting(now) -> tuple:
+    """(items, note): pending work from sync state plus a DRY plan. Never writes anything."""
+    st = _load_state()
+    names = {j["id"]: j.get("name") or j["id"] for j in _crons()}
+    name = lambda jid: names.get(jid, jid)  # noqa: E731
+    items: List[str] = []
+    for jid, last in sorted(st.get("jobs", {}).items()):
+        if last.get("split_pending"):
+            sp = last["split_pending"]
+            items.append(f"{name(jid)}: 'this and following' -> cron {sp.get('cron')} waits until the old series "
+                         f"ends {sp.get('until')}")
+        if last.get("pending_move"):
+            items.append(f"{name(jid)}: a moved run's event hand-over is unfinished; the next --confirm retries it")
+    for rec in st.get("occurrences", {}).values():
+        later = (planner.instant(rec.get("original_slot")) or 0) > now.timestamp()
+        if rec.get("status") == "noticed" and later:
+            items.append(f"{name(rec.get('source_job_id'))}: run at {rec['original_slot']} was deleted in Calendar "
+                         "but WILL still happen")
+        elif rec.get("status") == "pending" and rec.get("mode") == "additional" and later:
+            items.append(f"{name(rec.get('source_job_id'))}: moved copy at {rec.get('moved_start')}; the original "
+                         f"{rec['original_slot']} also runs")
+    if not st.get("calendar_id"):
+        return items, "no calendar bound (hermes hermes-jobs bind primary); cron only"
+    plan = sync(confirm=False)
+    if plan.get("error"):
+        return items, f"calendar not checked ({plan['error'][:160]}); cron only. Sign in: {AUTH_HINT}"
+    for op in plan.get("ops", []):
+        if op["direction"] != "state":
+            items.append(f"{name(op['job_id'])}: {op['action']} - {op['reason']}")
+    items += plan.get("info", [])
+    if any(o["action"] == "create_once" for o in plan.get("ops", [])):
+        items.append("a moved run needs --allow-additional-run (its original slot also runs)")
+    return list(dict.fromkeys(items)), None
+
+
+def jobs_command(raw_args: str = "") -> str:
+    """/jobs: read-only agenda + what is waiting on you. Plans with a dry run; never writes."""
+    from datetime import datetime
+    now = _now()
+    try:
+        zone = _job_zone({})
+    except Exception:  # noqa: BLE001
+        zone = datetime.now().astimezone().tzinfo
+    try:
+        rows = _agenda(now)
+        items, note = _waiting(now)
+    except Exception as exc:  # noqa: BLE001
+        return "hermes-jobs: " + redact(f"{type(exc).__name__}: {exc}")[:300]
+    out = [f"Hermes jobs, next {AGENDA_DAYS} days ({getattr(zone, 'key', None) or zone}):"]
+    for ts, label, due in rows:
+        when = datetime.fromtimestamp(ts, zone).strftime("%a %d %b %H:%M")
+        out.append(f"  {when}  {label}" + ("  (due, not run yet)" if due else ""))
+    if not rows:
+        out.append("  (nothing scheduled)")
+    out.append("Waiting on you (dry run, nothing written):")
+    out += [f"  - {i}" for i in items] or ["  (nothing pending)"]
+    if note:
+        out.append(f"  note: {note}")
+    out.append(f"Apply the plan: {CONFIRM_COMMAND}")
+    return "\n".join(out)
+
+
 def _tool(args: Dict[str, Any], **_: Any) -> str:
     action = (args or {}).get("action", "status")
     fn = {"discover": discover, "plan": lambda: sync(confirm=False)}.get(action, status)
@@ -803,6 +904,9 @@ def register(ctx) -> None:
         setup_fn=_setup,
         handler_fn=_cli,
     )
+    if hasattr(ctx, "register_command"):
+        ctx.register_command("jobs", jobs_command,
+                             description="Read-only: next 7 days of Hermes jobs and what is waiting on you (dry run)")
     ctx.register_tool(
         name="hermes_jobs_discover",
         toolset="hermes-jobs",

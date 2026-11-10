@@ -1,35 +1,55 @@
 # hermes-jobs (automation)
 
-Hermes cron is the system of record. ONE Google Calendar ("Hermes Jobs") is the job board:
-see/drag your agent's jobs where you already look at time. Not a calendar CRUD product.
+**Your Hermes agent's scheduled work shows up on the calendar you already live in, and dragging it
+there safely reschedules the real cron job.**
 
-## Network / credentials (disclose for catalog)
+Hermes cron is the system of record. ONE Google Calendar is the job board. Every change, in either
+direction, is planned as a dry run first and only applied when you run `--confirm`.
 
-- Calls `https://www.googleapis.com` (Calendar API v3) only after Hermes oauth sign-in.
-- Scope: `https://www.googleapis.com/auth/calendar.events` only (no Gmail/Drive/full calendar).
-- Declare client under `oauth:` in `plugin.yaml`; sign in with `hermes auth add hermes-jobs:google`.
-- Plugin uses `credentialed_provider_request("google", …)` — never reads `google_token.json`, `.env`, browser profiles, or google-workspace skill tokens.
+![hermes-jobs: dry run, --confirm creates the recurring event, re-sync shows 0 ops](docs/demo.gif)
 
-- Full detail of what leaves the machine, local files and revocation: [SECURITY.md](SECURITY.md).
+## Happy path
 
-### Disclosure (catalog rule 13)
+```bash
+hermes hermes-jobs discover          # read-only: your cron jobs, oauth status, bound calendar
+hermes hermes-jobs sync              # dry run: the exact ops in both directions, nothing written
+hermes hermes-jobs sync --confirm    # apply that plan
+```
 
-- **Network**: Google Calendar API v3 on the ONE bound calendar only, via Hermes oauth. Every `sync`
-  (dry-runs too) reads events; only `sync --confirm` writes. Sent: job name, schedule/RRULE, job id,
-  prompt sha256 digest, private tags. Never the prompt text or execution config.
-- **Reads outside plugin data**: `~/.hermes/cron/jobs.json` and Hermes config (time zone), read-only.
-- **Cron changes**: only through Hermes' `cronjob_manage` tool, only on `--confirm`.
-- **Experimental skip only** (off by default): writes `~/.hermes/scripts/hermes-jobs-skip-tick.py` and
-  creates two one-shot `no_agent` cron jobs that run `hermes hermes-jobs skip-tick --quiet` (fixed argv,
-  no shell). No other background processes; no telemetry; no stored credentials.
+In a Hermes chat, **`/jobs`** prints the next 7 days of Hermes jobs in agenda order, what is waiting on
+you (pending ops from a dry-run plan, deferred "this and following" changes, unfinished moves), and the
+exact confirm command. It never writes. Without Google sign-in it still shows the cron-only agenda.
 
-## Never
+Drag a recurring job's series in Calendar ("all events") and the next sync proposes the matching cron
+change; edit the job in Hermes and the event follows (cron wins). All four of Google's recurring edits
+("this event", "all events", "this and following", delete one instance) were tested live on Google
+Calendar on 2026-11-09/10; what each one does is under [Recurring Google events](#recurring-google-events-event-mode-recurring-the-default).
 
-- Event text never grants tools, permissions, or prompts. A calendar title can only become a job *name*
-  (sanitised: NFKC, no control/format/bidi/zero-width characters, single line, max 120 chars); a
-  calendar time can only become a validated schedule. Descriptions are never parsed.
-- No scopes beyond `calendar.events`.
-- No writes without explicit `--confirm`. Discover never creates calendars or cron jobs.
+**Run outcome.** Once a job has run, the dry run shows a `mark_run` op and the next confirmed sync colours its event from Hermes' own
+`last_run_at` / `last_status` (Basil green = `ok`, Tomato red = `error`, Banana yellow = anything else,
+e.g. `delivery_failed`) and keeps exactly one `last run: <local time> <status>` line in the description.
+The line is replaced, never accumulated; the title is never touched; an unchanged outcome plans nothing;
+a job that has never run gets no colour and no line. The error text itself never leaves the machine.
+
+## Auto-sync (opt-in recipe, once you trust the plan)
+
+The plugin never schedules itself and registers no hooks. If you want calendar edits picked up
+without typing, create your own Hermes `no_agent` cron job with a fixed argv (no LLM, no shell
+expansion of event text):
+
+```bash
+cat > ~/.hermes/scripts/hermes-jobs-sync.sh <<'SH'
+#!/bin/sh
+exec "$HOME/.local/bin/hermes" hermes-jobs sync --confirm   # use your `command -v hermes`
+SH
+hermes cron create --no-agent --script hermes-jobs-sync.sh --deliver local \
+  --name "hermes-jobs auto-sync" "0 * * * *"
+```
+
+`--confirm` still refuses a moved occurrence of a recurring job unless you pass `--allow-additional-run` by hand, so the
+recipe never accepts a duplicate run for you; `/jobs` lists it as waiting on you. The sync job is a cron
+job like any other, so it appears on the board (one event that moves forward each hour). Stop it with
+`hermes cron pause <id>` or `hermes cron remove <id>`.
 
 ## Setup
 
@@ -51,9 +71,36 @@ hermes hermes-jobs status
 hermes hermes-jobs sync       # dry-run by default
 ```
 
-## Repo
+## Disclosure: network / credentials (catalog rule 13)
 
-https://github.com/CrowBe/hermes-jobs
+- Calls `https://www.googleapis.com` (Calendar API v3) only after Hermes oauth sign-in.
+- Scope: `https://www.googleapis.com/auth/calendar.events` only (no Gmail/Drive/full calendar).
+- Declare client under `oauth:` in `plugin.yaml`; sign in with `hermes auth add hermes-jobs:google`.
+- Plugin uses `credentialed_provider_request("google", …)` — never reads `google_token.json`, `.env`, browser profiles, or google-workspace skill tokens.
+
+- Full detail of what leaves the machine, local files and revocation: [SECURITY.md](SECURITY.md).
+
+### What leaves the machine
+
+- **Network**: Google Calendar API v3 on the ONE bound calendar only, via Hermes oauth. Every `sync`
+  (dry-runs too) reads events; only `sync --confirm` writes. Sent: job name, schedule/RRULE, job id,
+  prompt sha256 digest, private tags, and once a job has run its last-run time and status word (`ok`,
+  `error`, ...) as an event colour + one description line. Never the prompt text, execution config or
+  error text.
+- **Reads outside plugin data**: `~/.hermes/cron/jobs.json` and Hermes config (time zone), read-only.
+- **Cron changes**: only through Hermes' `cronjob_manage` tool, only on `--confirm`.
+- **Experimental skip only** (off by default): writes `~/.hermes/scripts/hermes-jobs-skip-tick.py` and
+  creates two one-shot `no_agent` cron jobs that run `hermes hermes-jobs skip-tick --quiet` (fixed argv,
+  no shell). No other background processes; no telemetry; no stored credentials.
+
+## Never
+
+- Event text never grants tools, permissions, or prompts. A calendar title can only become a job *name*
+  (sanitised: NFKC, no control/format/bidi/zero-width characters, single line, max 120 chars); a
+  calendar time can only become a validated schedule. Descriptions are never parsed (the plugin only
+  recognises its own `last run:` line, to replace it).
+- No scopes beyond `calendar.events`.
+- No writes without explicit `--confirm`. Discover never creates calendars or cron jobs.
 
 ## Sync (0.3.0)
 
@@ -69,7 +116,8 @@ hermes hermes-jobs capture-fixtures <job_id> # read-only GETs -> sanitised tests
 ```
 
 - cron -> calendar: one 15-min event per job at its next run, tagged `extendedProperties.private.hermes_job_id`;
-  title = job name (`[paused] ` prefix when paused); description = job id + prompt sha256 digest only.
+  title = job name (`[paused] ` prefix when paused); description = job id + prompt sha256 digest only,
+  plus one `last run:` line once the job has run (see Run outcome).
 - calendar -> cron (tagged events only, via Hermes' `cronjob_manage`): retitle -> name update;
   deleting an event **pauses**, never removes, its job. Untagged events are ignored and event text
   never grants tools or edits prompts.
@@ -78,39 +126,6 @@ hermes hermes-jobs capture-fixtures <job_id> # read-only GETs -> sanitised tests
   tests, recurring-edit edge cases, and fixtures in `tests/fixtures`: `captured_*` are sanitised read-only GETs of the live probe,
   `documented_*` are built from Google's documented payload shapes and are marked as such). No Google
   calls or real cron writes.
-
-### Derived ids (reference stability)
-
-Every scheduled occurrence has a stable **occurrence key**:
-`uuid5(3ac1ead0-9909-5599-8d64-da65c43647dc, "<job_id>@<instant as ISO UTC>")`, written as 32 lowercase
-hex. The namespace is a fixed literal and must never change. The instant is canonicalised to UTC, so
-`09:00+11:00` and `22:00Z` give the same key. Hex is a subset of Google's event-id alphabet (base32hex
-`a-v0-9`, 5-1024 chars), so the key doubles as a client-chosen Google event id.
-
-- **Inserts** use the key of the occurrence the event shows as its Google event id. A retried insert
-  gets `409`, and that means "already exists, adopt it": the plugin reads the event and patches it to
-  the desired body. `status: confirmed` brings back a cancelled event that reused the id. An id owned
-  by a *different* job's tag is refused, never taken over.
-- **A recurring job's event shows its next occurrence and is patched forward, not recreated.** The id
-  is fixed when the event is inserted. Each advance patches `start` and the private
-  `hermes_occurrence` tag (the key of the occurrence it now shows) on the same event. That is one
-  write per advance, never a delete plus insert, and Google keeps no trail of dead event ids. Insert
-  retries stay idempotent through the derived id. Finding "what is tied to slot X" means matching
-  `hermes_occurrence`, or the copy's `hermes_original_slot`, not the event id.
-- **Every write sends the full private tag set** (`hermes_job_id`, `hermes_occurrence`, and for
-  copies `hermes_source_job_id` + `hermes_original_slot`), so a PATCH can never strip the job tag.
-- **One-shot copies and skips** are recorded in sync state under `occurrences[<key of the original
-  slot>]`. Each record holds the source job, child job, event, mode, status, and the source's
-  fingerprint: a digest of schedule + copied execution config, without name, enabled or grace.
-- **Rebuilding after a lost state file:** calendar events are found by `hermes_job_id` and adopted,
-  never deleted or recreated. Copy links come back from the event tags. A pause caused by deleting
-  its event is recognised from Hermes' own `paused_reason` (`hermes-jobs: calendar event deleted`),
-  so the deleted event is still not recreated. An armed experimental skip comes back from its pause
-  marker (see below); its wake-up jobs are matched by name AND the installed script, never by name alone. A copy whose create succeeded but whose result was lost is adopted on retry,
-  matched by name + one-shot instant; it is never created twice and never gets its own duplicate event.
-- **Existing events keep their Google-assigned ids** (the two live probe events). They are adopted
-  by tag, and they pick up `hermes_occurrence` on their next patch-forward. Nothing is deleted or
-  recreated to migrate them.
 
 ### Recurring Google events (event mode `recurring`, the default)
 
@@ -287,3 +302,41 @@ Sync is not a transaction across cron and Google; run a fresh dry-run after any 
 
 Offline mode projects against an empty calendar **and empty sync history**, so it never interprets
 unfetched events as deletions. It does not bind a calendar, call Google, or change cron/state.
+
+## Derived ids (reference stability)
+
+Every scheduled occurrence has a stable **occurrence key**:
+`uuid5(3ac1ead0-9909-5599-8d64-da65c43647dc, "<job_id>@<instant as ISO UTC>")`, written as 32 lowercase
+hex. The namespace is a fixed literal and must never change. The instant is canonicalised to UTC, so
+`09:00+11:00` and `22:00Z` give the same key. Hex is a subset of Google's event-id alphabet (base32hex
+`a-v0-9`, 5-1024 chars), so the key doubles as a client-chosen Google event id.
+
+- **Inserts** use the key of the occurrence the event shows as its Google event id. A retried insert
+  gets `409`, and that means "already exists, adopt it": the plugin reads the event and patches it to
+  the desired body. `status: confirmed` brings back a cancelled event that reused the id. An id owned
+  by a *different* job's tag is refused, never taken over.
+- **A recurring job's event shows its next occurrence and is patched forward, not recreated.** The id
+  is fixed when the event is inserted. Each advance patches `start` and the private
+  `hermes_occurrence` tag (the key of the occurrence it now shows) on the same event. That is one
+  write per advance, never a delete plus insert, and Google keeps no trail of dead event ids. Insert
+  retries stay idempotent through the derived id. Finding "what is tied to slot X" means matching
+  `hermes_occurrence`, or the copy's `hermes_original_slot`, not the event id.
+- **Every write sends the full private tag set** (`hermes_job_id`, `hermes_occurrence`, and for
+  copies `hermes_source_job_id` + `hermes_original_slot`), so a PATCH can never strip the job tag.
+- **One-shot copies and skips** are recorded in sync state under `occurrences[<key of the original
+  slot>]`. Each record holds the source job, child job, event, mode, status, and the source's
+  fingerprint: a digest of schedule + copied execution config, without name, enabled or grace.
+- **Rebuilding after a lost state file:** calendar events are found by `hermes_job_id` and adopted,
+  never deleted or recreated. Copy links come back from the event tags. A pause caused by deleting
+  its event is recognised from Hermes' own `paused_reason` (`hermes-jobs: calendar event deleted`),
+  so the deleted event is still not recreated. An armed experimental skip comes back from its pause
+  marker (see below); its wake-up jobs are matched by name AND the installed script, never by name alone. A copy whose create succeeded but whose result was lost is adopted on retry,
+  matched by name + one-shot instant; it is never created twice and never gets its own duplicate event.
+- **Existing events keep their Google-assigned ids** (the two live probe events). They are adopted
+  by tag, and they pick up `hermes_occurrence` on their next patch-forward. Nothing is deleted or
+  recreated to migrate them.
+
+## Repo
+
+https://github.com/CrowBe/hermes-jobs
+

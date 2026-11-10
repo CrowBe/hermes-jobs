@@ -49,7 +49,8 @@ def master_body(job: Dict[str, Any], props: Dict[str, str]) -> Dict[str, Any]:
 
 def _master_differs(ev, body) -> bool:
     wall_ev, wall_b = _wall(ev, body["tz"]), _wall(body, body["tz"])
-    return (ev.get("summary") != body["summary"] or ev.get("description") != body["description"]
+    return (ev.get("summary") != body["summary"]
+            or P.strip_run(ev.get("description")) != P.strip_run(body["description"])
             or list(ev.get("recurrence") or []) != body["recurrence"] or (ev.get("tz") or body["tz"]) != body["tz"]
             or (wall_ev and wall_b and (wall_ev.hour, wall_ev.minute) != (wall_b.hour, wall_b.minute)))
 
@@ -107,7 +108,32 @@ def plan(jobs: List[Dict[str, Any]], events: List[Dict[str, Any]], state: Dict[s
     single_state = {k: v for k, v in state.items() if k not in skip_ids}
     single_occ = {k: r for k, r in occurrences.items() if r.get("source_job_id") not in rec_jobs}
     ops += planner.plan(single_jobs, single_events, single_state, single_occ)
-    return ops
+    return ops + outcome_ops(jobs, series, state, ops)
+
+
+# Ops that already write (or remove) the job's whole event; outcome waits for the next sync.
+_OWNS_EVENT = {"insert_event", "convert_to_recurring", "convert_to_single", "delete_event", "pause_job",
+               "adopt_split", "drop_move", "finish_move", "forget"}
+
+
+def outcome_ops(jobs, series, state, ops) -> List[Dict[str, Any]]:
+    """Last run outcome onto the job's current event: colorId + one replaced "last run:" line.
+    Compared against what Google holds now, so an unchanged outcome plans nothing. Never the title."""
+    busy = {o["job_id"] for o in ops if o["action"] in _OWNS_EVENT
+            or (o["action"] == "patch_event" and "description" in (o.get("event") or {}))}
+    out: List[Dict[str, Any]] = []
+    for job in jobs:
+        line, jid = P.run_line(job), job["id"]
+        if not line or job.get("terminal") or jid in busy:
+            continue
+        ev = choose_current(jid, state.get(jid) or {}, series)
+        if not ev or is_history(ev):
+            continue
+        desc, color = P.with_run(ev.get("description"), line), P.run_color(job)
+        if desc != ev.get("description") or color != ev.get("color_id"):
+            out.append(_op("cron->calendar", "mark_run", jid, f"{line} (event colour + description line only)",
+                           event_id=ev["id"], event={"description": desc, "color_id": color}))
+    return out
 
 
 def _plan_job(job, last, cur, series, exceptions, occurrences, recurring) -> List[Dict[str, Any]]:
