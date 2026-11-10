@@ -163,19 +163,21 @@ def has_until(lines) -> bool:
 def until_instant(lines) -> Optional[datetime]:
     try:
         u = parse_rrule(lines).get("UNTIL")
-    except Unconvertible:
+        if not u:
+            return None
+        from datetime import timezone
+        if "T" in u:
+            return datetime.strptime(u.rstrip("Z"), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        return datetime.strptime(u, "%Y%m%d").replace(tzinfo=timezone.utc)
+    except (Unconvertible, ValueError):
         return None
-    if not u:
-        return None
-    from datetime import timezone
-    if "T" in u:
-        return datetime.strptime(u.rstrip("Z"), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-    return datetime.strptime(u, "%Y%m%d").replace(tzinfo=timezone.utc)
 
 
 def rrule_to_cron(lines, start_local: datetime) -> Tuple[Optional[str], Optional[str]]:
     """Inverse for adoption. ``start_local`` = DTSTART on the event's own wall clock."""
     try:
+        if start_local is None:
+            raise Unconvertible("event has no timed start (all-day events cannot become cron)")
         r = parse_rrule(lines)
         for bad in ("COUNT", "UNTIL", "BYSETPOS", "BYHOUR", "BYMINUTE", "BYSECOND", "BYWEEKNO", "BYYEARDAY"):
             if bad in r:

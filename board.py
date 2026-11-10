@@ -266,7 +266,9 @@ def _plan_job(job, last, cur, series, exceptions, occurrences, recurring) -> Lis
                                "one-shot copy follows", updates={"schedule": e["start"]}, occurrence=key,
                                moved_start=e["start"]))
             continue
-        if not job.get("enabled", True):
+        if not e.get("start"):
+            ops.append(_op("report", "notice", jid, f"instance {orig} has no timed start (all-day?); ignored"))
+        elif not job.get("enabled", True):
             ops.append(_op("state", "record", jid, "instance moved while job paused: kept on calendar only"))
         elif job.get("copy_error"):
             ops.append(_op("report", "notice", jid, "move refused: " + job["copy_error"]))

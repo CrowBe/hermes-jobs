@@ -202,7 +202,7 @@ def plan(jobs: List[Dict[str, Any]], events: List[Dict[str, Any]], state: Dict[s
             else:
                 ops.append(_op("state", "record", jid, "event already matches cron", event_id=ev["id"]))
             continue
-        moved = instant(ev.get("start")) != instant(last.get("start"))
+        moved = ev.get("start") is not None and instant(ev.get("start")) != instant(last.get("start"))
         retitled = ev.get("summary") != last.get("summary")
         if moved:
             if job.get("enabled", True):
