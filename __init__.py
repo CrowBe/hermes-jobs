@@ -125,6 +125,33 @@ def _is_wake_job(raw: dict) -> bool:
     return str(raw.get("name") or "").startswith(skip.WAKE_PREFIX) and raw.get("script") == skip.SCRIPT_NAME
 
 
+# The README's auto-sync recipes. Such a job never gets a board event: under push sync, its own run
+# outcome (mark_run) would be a calendar change that triggers the next run, about once a minute.
+AUTO_SYNC_SCRIPTS = frozenset({"hermes-jobs-auto.sh", "hermes-jobs-sync.sh"})
+
+
+def _is_auto_sync_job(raw: dict) -> bool:
+    """A no_agent job whose script is a recipe script, or whose script runs `hermes-jobs sync`.
+    Never decided by the display name, which anyone can set."""
+    script = raw.get("script")
+    if not raw.get("no_agent") or not isinstance(script, str) or not script.strip():
+        return False
+    base = Path(script).name
+    if base in AUTO_SYNC_SCRIPTS:
+        return True
+    try:
+        text = (_home() / "scripts" / base).read_text(encoding="utf-8", errors="replace")[:8192]
+    except OSError:
+        return False
+    return "hermes-jobs sync" in text
+
+
+def _off_board(raw: dict) -> bool:
+    """Jobs the board never shows: our skip wake-ups and the auto-sync job. An event left over for
+    one is planned for deletion like any removed job's."""
+    return _is_wake_job(raw) or _is_auto_sync_job(raw)
+
+
 def _view(raw: dict) -> dict:
     """Planner view of one raw cron record. Prompts never flow to Calendar."""
     sched = raw.get("schedule") or {}
@@ -166,7 +193,7 @@ def _view(raw: dict) -> dict:
 
 def _crons() -> list:
     """Read-only view. No scheduler writes."""
-    return [_view(raw) for raw in _raw_jobs() if not _is_wake_job(raw)]
+    return [_view(raw) for raw in _raw_jobs() if not _off_board(raw)]
 
 
 def _state_file() -> Path:
@@ -850,7 +877,7 @@ def _agenda(now) -> List[tuple]:
     from datetime import timedelta
     end, rows = (now + timedelta(days=AGENDA_DAYS)).timestamp(), []
     for raw in _raw_jobs():
-        if _is_wake_job(raw):
+        if _off_board(raw):
             continue
         j = _view(raw)
         at, n = j["start"], 0

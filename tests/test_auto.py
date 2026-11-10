@@ -181,3 +181,73 @@ class AutoTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def autojob(**kw):
+    """The README recipe's auto-sync job, as Hermes stores it, after one run."""
+    return {"id": "auto1", "name": "hermes-jobs auto-sync", "prompt": "", "no_agent": True,
+            "script": "hermes-jobs-auto.sh", "enabled": True, "state": "scheduled",
+            "schedule": {"kind": "cron", "expr": "0 */6 * * *"}, "next_run_at": "2026-11-10T18:00:00+11:00",
+            "timezone": "Australia/Sydney", "last_run_at": "2026-11-10T02:58:20+00:00", "last_status": "ok", **kw}
+
+
+class AutoSyncJobOffBoardTest(unittest.TestCase):
+    """Live e2e found a loop: the auto-sync run's own mark_run was a calendar change that fired it again."""
+
+    def setUp(self):
+        TR.RuntimeTest.setUp(self)
+        self.patches[0].stop()  # real _crons() over self.raw
+        import tempfile
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.home = TR.pathlib.Path(home.name)
+        p = patch.object(M, "_home", return_value=self.home)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_identified_by_script_never_by_name(self):
+        self.assertTrue(M._is_auto_sync_job(autojob()))
+        self.assertTrue(M._is_auto_sync_job(autojob(script="/home/me/.hermes/scripts/hermes-jobs-sync.sh")))
+        self.assertFalse(M._is_auto_sync_job(autojob(no_agent=False)))  # an agent job is a real job
+        self.assertFalse(M._is_auto_sync_job(autojob(script=None)))
+        self.assertFalse(M._is_auto_sync_job(autojob(script="backup.sh")))
+        (self.home / "scripts").mkdir()
+        (self.home / "scripts" / "my-sync.sh").write_text('#!/bin/sh\nexec hermes hermes-jobs sync --auto\n')
+        self.assertTrue(M._is_auto_sync_job(autojob(script="my-sync.sh")))  # renamed script, same command
+
+    def test_name_alone_keeps_a_job_on_the_board(self):
+        self.raw = [autojob(no_agent=False, script=None)]
+        self.assertEqual([j["id"] for j in M._crons()], ["auto1"])
+
+    def test_auto_sync_job_gets_no_insert_mark_or_update(self):
+        self.raw = [autojob()]
+        self.assertEqual(M._crons(), [])
+        ops = B.plan(M._crons(), [], {"auto1": {"event_id": None}})
+        self.assertFalse({"insert_event", "mark_run", "patch_event", "update_job"} & set(acts(ops)))
+        self.assertNotIn("hermes-jobs auto-sync", M.jobs_command(""))  # not on the /jobs agenda either
+
+    def test_leftover_event_is_deleted_like_a_removed_job(self):
+        self.raw = [autojob()]
+        for events in ([ev(id="ea", hermes_job_id="auto1")],
+                       [master(id="ma", hermes_job_id="auto1", recurrence=["RRULE:FREQ=DAILY"])]):
+            ops = B.plan(M._crons(), events, {})
+            self.assertEqual([(o["action"], o["event_id"]) for o in ops], [("delete_event", events[0]["id"])])
+
+    def test_run_completes_then_sync_writes_nothing(self):
+        self.raw = [autojob(last_run_at=None, last_status=None)]
+        self.events = [ev(id="ea", hermes_job_id="auto1")]  # an event from before the fix
+        M._save_state({"calendar_id": "test-calendar", "jobs": {}, "occurrences": {}})
+        self.arm_cron_tripwires()
+        first = M.sync(auto=True)
+        self.assertEqual((first["writes"], first["errors"]), (1, []))
+        self.cal.delete.assert_called_once_with("ea")
+        self.cal.reset_mock()
+        self.events = []  # Google now has it as cancelled (untagged): gone from the board
+        for n in range(3):  # each run stamps last_run_at/last_status; the following sync must not echo it
+            self.raw = [autojob(last_run_at=f"2026-11-10T03:0{n}:20+00:00", last_status="ok")]
+            res = M.sync(auto=True)
+            self.assertEqual((res["writes"], res["ops"], res["held"]), (0, [], []))
+        for meth in ("insert", "patch", "delete"):
+            getattr(self.cal, meth).assert_not_called()
+
+    arm_cron_tripwires = AutoTest.arm_cron_tripwires
