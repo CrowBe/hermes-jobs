@@ -47,8 +47,9 @@ hermes cron create --no-agent --script hermes-jobs-sync.sh --deliver local \
 ```
 
 `--confirm` still refuses a moved occurrence of a recurring job unless you pass `--allow-additional-run` by hand, so the
-recipe never accepts a duplicate run for you; `/jobs` lists it as waiting on you. The sync job is a cron
-job like any other, so it appears on the board (one event that moves forward each hour). Stop it with
+recipe never accepts a duplicate run for you; `/jobs` lists it as waiting on you. The sync job itself is
+kept off the board: a `no_agent` job whose script is `hermes-jobs-auto.sh` or `hermes-jobs-sync.sh`, or
+whose script runs `hermes-jobs sync`, never gets an event (a leftover one is deleted). Stop it with
 `hermes cron pause <id>` or `hermes cron remove <id>`.
 
 ## Push sync (experimental, MCP Events; branch `mcp-events`)
@@ -122,9 +123,10 @@ Notes and limits:
 
 - `public_url` must be `https://` (Hermes' client refuses anything else). It does not need to be public.
   `tailscale serve` on this machine is enough, since the server runs here.
-- **Known issue (found live):** your own `sync --auto` writes come back as one more event. If the auto-sync job is
-  itself synced to the calendar, each run's `mark_run` on its own event triggers the next run, about once a
-  minute. Until that is fixed, don't run push sync unattended.
+- **Fixed (found live):** the auto-sync job used to be synced to the calendar, so each run's `mark_run` on its
+  own event triggered the next run, about once a minute. It is now kept off the board (identified by its
+  `no_agent` script, never its name; a leftover event is deleted once), so a run produces no calendar write
+  of its own. Other writes by `sync --auto` still come back as one more event, whose sync plans nothing.
 - Every Hermes process that connects the server (the gateway, a chat session) runs its own poller.
   Identical changes carry the same `eventId`, and the gateway dedupes on it.
 - The subscription lives in memory and lasts up to 24h. Hermes refreshes it at 80% and on every
