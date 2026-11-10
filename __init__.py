@@ -199,7 +199,7 @@ def _oauth_status() -> Dict[str, Any]:
             "note": (
                 "This Hermes build lacks credentialed_provider_request / plugin oauth. "
                 "Declare oauth: in plugin.yaml for catalog; run `hermes update`, then "
-                f"`{AUTH_HINT}` (CrowClaws: crowsclaw001@gmail.com)."
+                f"`{AUTH_HINT}`."
             ),
         }
     return {
@@ -491,6 +491,7 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                     links.setdefault(jid, {}).pop("split_pending", None)
                     _save_state(st)
             elif a == "adopt_split":
+                upd = _safe_updates({"schedule": op["cron"]}) if op.get("cron") else None  # gate before any write
                 gc.patch(op["series_id"], op["event"])  # tags only; Google's own start/RRULE kept
                 entry = links.setdefault(jid, {})
                 entry["history_ids"] = sorted(set(entry.get("history_ids") or []) | {op["old_id"]})
@@ -498,12 +499,12 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                 _save_state(st)
                 if op.get("cron"):
                     if op["cron_now"]:
-                        _check(cron({"action": "update", "job_id": jid, "schedule": op["cron"]}))
+                        _check(cron({"action": "update", "job_id": jid, **upd}))
                     else:
                         entry["split_pending"] = {"cron": op["cron"], "until": op["until"]}
                         _save_state(st)
             elif a == "apply_split":
-                _check(cron({"action": "update", "job_id": jid, "schedule": op["updates"]["schedule"]}))
+                _check(cron({"action": "update", "job_id": jid, **_safe_updates(op["updates"])}))
                 links.setdefault(jid, {}).pop("split_pending", None)
                 _save_state(st)
             elif a == "skip_instance":
