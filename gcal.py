@@ -24,11 +24,17 @@ class Conflict(CalendarError):
     """409: an event with this client-chosen id already exists (possibly cancelled)."""
 
 
+class Gone(CalendarError):
+    """410 on a read: an incremental-sync token expired; the caller resyncs from scratch."""
+
+
 def _req(method: str, url: str, body: Optional[dict] = None) -> Any:
     from hermes_cli.plugin_provider_requests import credentialed_provider_request
     resp = credentialed_provider_request("google", method, url, json=body, timeout=20)
-    if resp.status == 410 and method == "DELETE":
-        return None  # already gone
+    if resp.status == 410:
+        if method == "DELETE":
+            return None  # already gone
+        raise Gone(f"{method} {url.split('?')[0]} -> 410")
     if resp.status == 409:
         raise Conflict(f"{method} {url.split('?')[0]} -> 409")
     if resp.status >= 300:
@@ -76,6 +82,24 @@ class Calendar:
             token = data.get("nextPageToken")
             if not token:
                 return out
+
+    def changes(self, token: Optional[str]) -> tuple:
+        """Google incremental sync: (raw changed items, next sync token). ``token=None`` pages the
+        calendar once for a baseline token and reports no changes. Raises Gone on 410."""
+        out, page = [], None
+        while True:
+            q: Dict[str, Any] = {"maxResults": 250, "singleEvents": "false"}
+            q.update({"syncToken": token} if token else {"showDeleted": "true"})
+            if page:
+                q["pageToken"] = page
+            data = _req("GET", f"{self.base}?{urlencode(q)}") or {}
+            if token:
+                out += [g for g in data.get("items", []) if isinstance(g, dict)]
+            page = data.get("nextPageToken")
+            if not page:
+                if not data.get("nextSyncToken"):
+                    raise CalendarError("events.list returned no nextSyncToken")
+                return out, data["nextSyncToken"]
 
     def get_raw(self, path: str = "", **query: Any) -> Any:
         """Read-only GET of raw Google JSON under this calendar's events (fixture capture)."""

@@ -800,6 +800,10 @@ def _cli(args) -> None:
         res = capture_fixtures(args.job_id, args.out)
     elif cmd == "mode":
         res = mode(args.mode)
+    elif cmd == "mcp-serve":  # stdio MCP server: stdout belongs to the protocol, print nothing
+        from . import events
+        events.serve(_load_state().get("calendar_id"), args.interval)
+        return
     elif cmd == "skip-tick":
         res = skip_tick(args.quiet)
         if args.quiet:
@@ -829,6 +833,8 @@ def _setup(p) -> None:
     c.add_argument("--out", default=str(Path(__file__).parent / "tests" / "fixtures"))
     m = sub.add_parser("mode", help="Show or set event mode: recurring (default) or single (fallback)")
     m.add_argument("mode", nargs="?", choices=["recurring", "single"])
+    e = sub.add_parser("mcp-serve", help="stdio MCP server: calendar.event_changed events (MCP Events, webhook)")
+    e.add_argument("--interval", type=int, default=60, help="Google incremental-sync poll seconds (min 30)")
     t = sub.add_parser("skip-tick", help="Advance pending experimental skips (run by their wake-up jobs)")
     t.add_argument("--quiet", action="store_true")
     s.add_argument("--offline", action="store_true", help="Plan against an empty calendar; no Google calls")
