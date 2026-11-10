@@ -52,7 +52,7 @@ kept off the board: a `no_agent` job whose script is `hermes-jobs-auto.sh` or `h
 whose script runs `hermes-jobs sync`, never gets an event (a leftover one is deleted). Stop it with
 `hermes cron pause <id>` or `hermes cron remove <id>`.
 
-## Push sync (experimental, MCP Events; branch `mcp-events`)
+## Push sync (experimental, MCP Events)
 
 Calendar edits can trigger a sync the moment they land, through Hermes' experimental MCP Events client
 (`tools/mcp_tool_events.py`, the `events/*` extension from the MCP Triggers & Events WG). Three parts:
