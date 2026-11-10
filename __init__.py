@@ -332,14 +332,21 @@ def _skip_decisions(recs: Dict[str, Any], raw_jobs: list) -> List[Dict[str, Any]
     return out
 
 
+# --auto applies only these directions: cron-originated calendar writes (insert/patch/delete/convert,
+# mark_run) and local state bookkeeping. Every calendar->cron op is held for a human --confirm.
+AUTO_DIRECTIONS = frozenset({"cron->calendar", "state"})
+
+
 def sync(confirm: bool = False, offline: bool = False, allow_additional_run: bool = False,
-         skip_original: Optional[str] = None) -> Dict[str, Any]:
+         skip_original: Optional[str] = None, auto: bool = False) -> Dict[str, Any]:
     if skip_original not in SKIP_MODES:
         return {"refused": True, "reason": "--skip-original accepts only 'experimental'", "writes": 0}
+    if auto and (confirm or allow_additional_run or skip_original):
+        return {"refused": True, "reason": "--auto takes no other apply flags", "writes": 0}
     st = _load_state()
     cal = st.get("calendar_id")
-    if confirm and (offline or not cal):
-        return {"refused": True, "reason": "--confirm needs a bound calendar and no --offline", "writes": 0}
+    if (confirm or auto) and (offline or not cal):
+        return {"refused": True, "reason": "--confirm/--auto need a bound calendar and no --offline", "writes": 0}
     try:
         raw_jobs = _raw_jobs()
         jobs, events = _crons(), _events(cal, offline)
@@ -387,6 +394,8 @@ def sync(confirm: bool = False, offline: bool = False, allow_additional_run: boo
                            + [w for d in decisions for w in d["warnings"]]}
     if decisions:
         out["skip_reconcile"] = decisions
+    if auto:
+        return _auto(out, ops, cal, st)
     unapproved = [o for o in ops if o["action"] == "create_once" and o["mode"] == "additional" and not allow_additional_run]
     if confirm and unapproved:
         out.update(refused=True, reason="A moved recurring occurrence needs explicit approval: either "
@@ -407,6 +416,31 @@ def sync(confirm: bool = False, offline: bool = False, allow_additional_run: boo
         if not out["errors"]:
             _snapshot(cal)
     return out
+
+
+def _auto(out: Dict[str, Any], ops: List[Dict[str, Any]], cal: str, st: Dict[str, Any]) -> Dict[str, Any]:
+    """Guarded sync: apply cron-originated ops only. Calendar-originated ops, notices and
+    experimental-skip reconciles are held and listed exactly as /jobs "Waiting on you" shows them;
+    their jobs keep their last baseline, so a held edit is still detected (and still waits) next run."""
+    names = {j["id"]: j.get("name") or j["id"] for j in _crons()}
+    held = [o for o in ops if o["direction"] not in AUTO_DIRECTIONS]
+    out.update(dry_run=False, auto=True, pending_ops=len(held),
+               held=[_op_line(o, names) for o in held] + out["info"])
+    if out.pop("skip_reconcile", None):
+        out["held"].append("experimental skip reconcile waits for --confirm")
+    if out["held"]:
+        out["next"] = CONFIRM_COMMAND
+    run = [o for o in ops if o["direction"] in AUTO_DIRECTIONS]
+    out["writes"], out["errors"] = _apply(run, cal, st, directions=AUTO_DIRECTIONS)
+    if not out["errors"]:
+        keep = {v for o in held for v in (o["job_id"], o.get("child_id")) if v}
+        _snapshot(cal, keep=frozenset(keep))
+    return out
+
+
+def _op_line(op: Dict[str, Any], names: Dict[str, str]) -> str:
+    """One pending op as /jobs shows it under "Waiting on you"."""
+    return f"{names.get(op['job_id'], op['job_id'])}: {op['action']} - {op['reason']}"
 
 
 SKIP_EXPERIMENTAL_WARNING = (
@@ -475,8 +509,11 @@ def _cron_dispatcher():
     return lambda args: ctx.dispatch_tool(CRON_TOOL, args)
 
 
-def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, Any]] = None):
+def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, Any]] = None,
+           directions: Optional[frozenset] = None):
     from .gcal import Calendar
+    if directions is not None and any(o["direction"] not in directions for o in ops):
+        raise RuntimeError("refusing ops outside the allowed directions; nothing written")
     needs_cron = any(o["direction"] == "calendar->cron" for o in ops)
     # Preflight before ANY write so a missing cron tool cannot leave calendar-only partial syncs.
     cron = _cron_dispatcher() if needs_cron else None
@@ -678,8 +715,9 @@ def _check(result) -> dict:
     return data
 
 
-def _snapshot(calendar_id: str) -> None:
-    """Record what is now on both sides so the next run can tell who moved what."""
+def _snapshot(calendar_id: str, keep: frozenset = frozenset()) -> None:
+    """Record what is now on both sides so the next run can tell who moved what. Jobs in ``keep``
+    (held by --auto) keep their previous baseline untouched."""
     jobs = {j["id"]: j for j in _crons()}
     prev = _load_state()
     old = prev.get("jobs", {})
@@ -692,6 +730,8 @@ def _snapshot(calendar_id: str) -> None:
     events = _events(calendar_id, False)
     series = [e for e in events if e.get("status") != "cancelled" and not e.get("recurring_event_id")]
     for jid, j in jobs.items():
+        if jid in keep:
+            continue
         entry = st["jobs"].get(jid, {})
         ev = board.choose_current(jid, entry, series)
         if not ev:
@@ -755,7 +795,7 @@ def _cli(args) -> None:
     if cmd == "bind":
         res = bind(args.calendar)
     elif cmd == "sync":
-        res = sync(args.confirm, args.offline, args.allow_additional_run, args.skip_original)
+        res = sync(args.confirm, args.offline, args.allow_additional_run, args.skip_original, args.auto)
     elif cmd == "capture-fixtures":
         res = capture_fixtures(args.job_id, args.out)
     elif cmd == "mode":
@@ -779,6 +819,8 @@ def _setup(p) -> None:
     b.add_argument("calendar")
     s = sub.add_parser("sync", help="Plan both directions; dry-run unless --confirm")
     s.add_argument("--confirm", action="store_true", help="Apply the plan (cron + calendar writes)")
+    s.add_argument("--auto", action="store_true",
+                   help="Guarded: apply only cron->calendar ops; hold every calendar edit for --confirm")
     s.add_argument("--allow-additional-run", action="store_true", help="Accept that a moved recurring occurrence ALSO runs at its original slot (requires --confirm)")
     s.add_argument("--skip-original", choices=["experimental"], default=None,
                    help="EXPERIMENTAL: truly skip a moved occurrence's original slot (pause/resume; books a 'missed' ledger row)")
@@ -849,7 +891,7 @@ def _waiting(now) -> tuple:
         return items, f"calendar not checked ({plan['error'][:160]}); cron only. Sign in: {AUTH_HINT}"
     for op in plan.get("ops", []):
         if op["direction"] != "state":
-            items.append(f"{name(op['job_id'])}: {op['action']} - {op['reason']}")
+            items.append(_op_line(op, names))
     items += plan.get("info", [])
     if any(o["action"] == "create_once" for o in plan.get("ops", [])):
         items.append("a moved run needs --allow-additional-run (its original slot also runs)")
