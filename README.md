@@ -1,9 +1,15 @@
 # hermes-jobs (automation)
 
+**hermes-jobs: Calendar sync for Hermes cron**
+
+Google Calendar is the one supported backend today: the plugin binds to one dedicated calendar, with OAuth scope `calendar.events` only.
+
+**Demo (85.8s):** https://x.com/BenCrow95406267/status/2120070542216871938
+
 **Your Hermes agent's scheduled work shows up on the calendar you already live in, and dragging it
 there safely reschedules the real cron job.**
 
-Hermes cron is the system of record. ONE Google Calendar is the job board. Every change, in either
+Hermes cron is the system of record. That one Google Calendar is the job board. Every change, in either
 direction, is planned as a dry run first and only applied when you run `--confirm`.
 
 ![hermes-jobs: dry run, --confirm creates the recurring event, re-sync shows 0 ops](docs/demo.gif)
