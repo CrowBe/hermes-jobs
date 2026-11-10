@@ -43,12 +43,23 @@ def _raw_jobs() -> list:
     return [j for j in jobs if isinstance(j, dict) and j.get("id")]
 
 
+def _hermes_timezone_name() -> str:
+    """The active profile's configured IANA zone (``""`` if none), via Hermes' public
+    ``hermes_time.get_timezone_name`` (profile-aware: ignores ``HERMES_TIMEZONE`` under the
+    multiplexed gateway). Older Hermes without it: ``HERMES_TIMEZONE`` then config ``timezone``."""
+    try:
+        from hermes_time import get_timezone_name
+    except ImportError:
+        import os
+        from hermes_cli.config import load_config_readonly
+        return os.environ.get("HERMES_TIMEZONE") or load_config_readonly().get("timezone") or ""
+    return get_timezone_name() or ""
+
+
 def _job_zone(raw: dict):
-    """Only public config reader + stdlib; no private cron imports or credential reads."""
-    import os
+    """Only public Hermes helpers + stdlib; no private cron imports or credential reads."""
     from zoneinfo import ZoneInfo
-    from hermes_cli.config import load_config_readonly
-    name = raw.get("timezone") or os.environ.get("HERMES_TIMEZONE") or load_config_readonly().get("timezone")
+    name = raw.get("timezone") or _hermes_timezone_name()
     if not name:
         target = str(Path("/etc/localtime").resolve())
         if "/zoneinfo/" in target:
