@@ -328,7 +328,7 @@ def build_server(hub: Hub):
     async def on_unsubscribe(ctx, p):  # noqa: ANN001
         return await call(hub.unsubscribe, p.name, p.arguments, p.delivery)
 
-    server = Server("hermes-jobs", version="0.4.0",
+    server = Server("hermes-jobs", version="0.3.0",
                     instructions=f"Subscribe to {EVENT} (webhook delivery) to trigger hermes-jobs sync --auto.")
     server.add_request_handler("events/list", ListParams, on_list)
     server.add_request_handler("events/subscribe", SubscribeParams, on_subscribe)
