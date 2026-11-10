@@ -1,5 +1,5 @@
 name: hermes-jobs
-version: "0.3.0"
+version: "0.3.1"
 requires_hermes: ">=0.22.6"
 description: "Automation: bidirectional sync between Hermes cron (system of record) and ONE Google Calendar job board. discover/status are read-only; sync plans both directions and is dry-run unless --confirm on the CLI."
 author: "Benjamin Crow (CrowBe) / Hermes Plugin Builder"
