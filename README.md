@@ -51,6 +51,15 @@ recipe never accepts a duplicate run for you; `/jobs` lists it as waiting on you
 job like any other, so it appears on the board (one event that moves forward each hour). Stop it with
 `hermes cron pause <id>` or `hermes cron remove <id>`.
 
+## Roadmap: push sync
+
+Today, sync is a dry run then `sync --confirm`, or a poll via the auto-sync cron recipe above. The goal is push, two ways:
+
+1. A Google Calendar `events.watch` webhook. That needs a public HTTPS endpoint (for example Tailscale Funnel) plus channel renewal, then an incremental sync.
+2. The proposed MCP events extension, once Hermes consumes server-pushed notifications. Hermes v0.23.0's MCP client acts only on `tools/list_changed`, progress, and logging; `resources/list_changed` is logged and ignored (see `tools/mcp_tool_health.py`).
+
+Either way the guard stays: cron-side changes and run outcome may auto-apply; calendar-side edits still wait for a confirm.
+
 ## Setup
 
 1. Create a Google Cloud **Desktop** OAuth client; enable Google Calendar API.
