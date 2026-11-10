@@ -108,11 +108,23 @@ Point it at the job by adding one key to that route, `"cron_job": "<auto-sync jo
 (`hermes cron list` shows the id), and check it with `hermes webhook list`. Re-running `subscribe_event`
 rewrites the route, so add `cron_job` again if you do. Every event then fires the auto-sync job.
 
+**Live-proven, Tue 10 Nov 2026 (omarchy, Hermes v0.23.0, `tailscale serve`, tailnet only):** Hermes' MCP Events
+client subscribed to `calendar.event_changed`, and the gateway answered our signed verification challenge.
+Renaming probe-a in Google Calendar produced one signed POST about 32s later (60s poll). The route's `cron_job` fired
+the `no_agent` auto-sync job, and `sync --auto` held the rename as `update_job` under `held`. `jobs.json` was
+unchanged apart from that job's own `last_run_at`/`last_status`. After the rename was reverted, the next
+delivery's sync held nothing. Still unproven: a subscription owned by the gateway itself. At gateway startup,
+the MCP refresh ran before the webhook listener was up and failed verification (502). Hermes then waits until
+the stored grant's refresh time instead of retrying after 30s, so the live test held the subscription from a
+separate Hermes session. Also unproven: 24h refresh, cursor replay after downtime, and dedupe across two pollers.
+
 Notes and limits:
 
 - `public_url` must be `https://` (Hermes' client refuses anything else). It does not need to be public.
   `tailscale serve` on this machine is enough, since the server runs here.
-- Your own `sync --auto` writes come back as one more event; that sync plans nothing, so it stops there.
+- **Known issue (found live):** your own `sync --auto` writes come back as one more event. If the auto-sync job is
+  itself synced to the calendar, each run's `mark_run` on its own event triggers the next run, about once a
+  minute. Until that is fixed, don't run push sync unattended.
 - Every Hermes process that connects the server (the gateway, a chat session) runs its own poller.
   Identical changes carry the same `eventId`, and the gateway dedupes on it.
 - The subscription lives in memory and lasts up to 24h. Hermes refreshes it at 80% and on every
