@@ -82,6 +82,11 @@ Calendar edits can trigger a sync the moment they land, through Hermes' experime
 3. **A webhook route** whose `cron_job` fires a `no_agent` job that runs `sync --auto`. Event data never
    reaches a model: the job is a script.
 
+Push is optional: `hermes hermes-jobs sync` works without it, run by hand or from a scheduled job.
+Push needs an https address where the Hermes gateway can be reached, such as `tailscale serve` on your
+tailnet; Tailscale Funnel or another public https front is only needed for the Apps Script fallback, and the
+gateway port (8644) should be bound to localhost or firewalled to the tailnet.
+
 Recipe (needs `hermes gateway run`: the gateway hosts the webhook listener, keeps the subscription
 refreshed, and runs the cron job):
 
