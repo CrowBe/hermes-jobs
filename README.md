@@ -35,7 +35,7 @@ see/drag your agent's jobs where you already look at time. Not a calendar CRUD p
 
 1. Create a Google Cloud **Desktop** OAuth client; enable Google Calendar API.
 2. Set `HERMES_JOBS_GOOGLE_CLIENT_ID` and `HERMES_JOBS_GOOGLE_CLIENT_SECRET` in the Hermes profile env.
-3. Sign in (use CrowClaws `crowsclaw001@gmail.com` for the bind account):
+3. Sign in:
 
 ```bash
 hermes auth add hermes-jobs:google
@@ -75,7 +75,7 @@ hermes hermes-jobs capture-fixtures <job_id> # read-only GETs -> sanitised tests
   never grants tools or edits prompts.
 - Conflicts: a cron edit wins and resets the event. A move never rewrites a recurring schedule.
 - Tests: `hermes --run-module unittest discover -s tests` (planner, mocked runtime, security/injection
-  tests, and fixtures in `tests/fixtures`: `captured_*` are sanitised read-only GETs of the live probe,
+  tests, recurring-edit edge cases, and fixtures in `tests/fixtures`: `captured_*` are sanitised read-only GETs of the live probe,
   `documented_*` are built from Google's documented payload shapes and are marked as such). No Google
   calls or real cron writes.
 
@@ -106,7 +106,7 @@ hex. The namespace is a fixed literal and must never change. The instant is cano
   never deleted or recreated. Copy links come back from the event tags. A pause caused by deleting
   its event is recognised from Hermes' own `paused_reason` (`hermes-jobs: calendar event deleted`),
   so the deleted event is still not recreated. An armed experimental skip comes back from its pause
-  marker (see below). A copy whose create succeeded but whose result was lost is adopted on retry,
+  marker (see below); its wake-up jobs are matched by name AND the installed script, never by name alone. A copy whose create succeeded but whose result was lost is adopted on retry,
   matched by name + one-shot instant; it is never created twice and never gets its own duplicate event.
 - **Existing events keep their Google-assigned ids** (the two live probe events). They are adopted
   by tag, and they pick up `hermes_occurrence` on their next patch-forward. Nothing is deleted or
@@ -146,7 +146,9 @@ id, no orphan. Like every write it appears in the dry-run first and needs `--con
 **Reading.** Events are listed with `singleEvents=false&showDeleted=true` (masters, singles, moved and
 cancelled instances), and each current master's `/instances?showDeleted=true` is read for the next 60
 days. Moved/cancelled instances are matched by `recurringEventId` + `originalStartTime`. Instances
-before the job's next run are history and ignored.
+before the job's next run are history and ignored. An event turned into an all-day event has no timed
+start: a single event is patched back to its cron time, a master or split series is reported and refused,
+and a moved all-day instance is ignored.
 
 What each Google edit does on the next sync (dry-run shows it; `--confirm` applies it):
 

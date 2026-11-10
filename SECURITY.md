@@ -30,7 +30,8 @@ Calendar content is untrusted. It can only change a job's **name** (from a title
 control/format/bidi/zero-width characters removed, single line, at most 120 characters) and its
 **schedule** (a validated timezone-aware ISO instant for one-shots and moved copies, or a canonical
 cron built from integers when an RRULE converts exactly). Descriptions are compared, never parsed.
-The dispatch gate (`_safe_updates`) drops every other field before `cronjob_manage` is called, so a
+The dispatch gate (`_safe_updates`) drops every other field before `cronjob_manage` is called, for every
+calendar-derived update including the cron taken from a "this and following" split, so a
 calendar edit can never set a prompt, tools, a script, delivery, or reach a shell. Deleting events
 only *pauses* jobs. Untagged events never create jobs.
 
@@ -55,6 +56,8 @@ only *pauses* jobs. Untagged events never create jobs.
 - Experimental skip only (`--skip-original=experimental`, off by default): writes the fixed script
   `<HERMES_HOME>/scripts/hermes-jobs-skip-tick.py` and creates two one-shot `no_agent` cron jobs that
   run `hermes hermes-jobs skip-tick --quiet` (fixed argument list, no shell, no input from Calendar).
+  When sync state is rebuilt, wake-up jobs are recognised by name and that script, so a job that merely
+  carries a wake-up-like name (names can come from Calendar titles) is never touched.
 
 ## Revoking access
 
