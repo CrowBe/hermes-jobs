@@ -51,15 +51,76 @@ recipe never accepts a duplicate run for you; `/jobs` lists it as waiting on you
 job like any other, so it appears on the board (one event that moves forward each hour). Stop it with
 `hermes cron pause <id>` or `hermes cron remove <id>`.
 
-## Roadmap: push sync
+## Push sync (experimental, MCP Events; branch `mcp-events`)
 
-Today, sync is a dry run then `sync --confirm`, or a poll via the auto-sync cron recipe above.
+Calendar edits can trigger a sync the moment they land, through Hermes' experimental MCP Events client
+(`tools/mcp_tool_events.py`, the `events/*` extension from the MCP Triggers & Events WG). Three parts:
 
-The planned push path is MCP Events. hermes-jobs will ship a small MCP server that watches the bound calendar (incremental sync token) and emits an event, e.g. `calendar.event_changed`, through the experimental `events/*` extension (`tools/mcp_tool_events.py`, from the MCP Triggers & Events WG). Hermes subscribes with `mcp_servers.<name>.events: true`, and delivery lands on a gateway webhook route (`gateway/platforms/webhook.py`, default port 8644) whose `cron_job` fires the "hermes-jobs auto-sync" job above, so calendar-side edits still wait for a confirm.
+1. **`hermes hermes-jobs sync --auto`**, the guarded sync. It applies only cron-originated ops
+   (insert/patch/delete/convert of events, run-outcome `mark_run`) and **holds every calendar-originated
+   op** (`update_job`, `adopt_split`, `apply_split`, `drop_move`, `pause_job`, `create_once`,
+   `finish_move`, deleted-instance skips). Held ops are listed under `held` exactly as `/jobs` shows them
+   under "Waiting on you", and their jobs keep their last baseline, so the edit keeps waiting until you
+   run `hermes hermes-jobs sync --confirm`. `--auto` never calls `cronjob_manage`.
+2. **`hermes hermes-jobs mcp-serve`**, a stdio MCP server with no tools and one event type,
+   `calendar.event_changed` (no arguments, `webhook` delivery only). While a subscription is live it polls
+   the bound calendar every 60s (`--interval`, min 30) with Google incremental sync (`syncToken`; a 410
+   resyncs and says so) and POSTs one Standard Webhooks-signed occurrence per batch of changes. The
+   payload is `{changes: [{eventId, etag, status, changedAt}], more?, resync?}`: ids, etags and times
+   only, never titles or descriptions. It answers `events/list`, `events/subscribe` (also the refresh;
+   grants up to 24h) and `events/unsubscribe`, sends the signed verification challenge before the first
+   delivery to a URL, uses the sync token as the replay `cursor`, and only delivers under this gateway's
+   own `platforms.webhook.extra.public_url` + `/webhooks/<route>` (no other URL, no redirects). Google
+   access is Hermes' plugin oauth, as for `sync`.
+3. **A webhook route** whose `cron_job` fires a `no_agent` job that runs `sync --auto`. Event data never
+   reaches a model: the job is a script.
 
-Fallback: a Google Apps Script installable calendar trigger on the bound calendar that signs a generic HMAC V2 POST to the same route (e.g. via Tailscale Funnel), because Google `events.watch` authenticates only with `X-Goog-Channel-Token` and cannot satisfy the gateway's GitHub, GitLab, Svix/Standard Webhooks, Linear, or HMAC V2 (`X-Webhook-Signature-V2` + `X-Webhook-Timestamp`) checks.
+Recipe (needs `hermes gateway run`: the gateway hosts the webhook listener, keeps the subscription
+refreshed, and runs the cron job):
 
-The guard stays: cron-side changes and run outcome may auto-apply; calendar-side edits still wait for a confirm.
+```bash
+cat > ~/.hermes/scripts/hermes-jobs-auto.sh <<'SH'
+#!/bin/sh
+exec "$HOME/.local/bin/hermes" hermes-jobs sync --auto   # use your `command -v hermes`
+SH
+hermes cron create --no-agent --script hermes-jobs-auto.sh --deliver local \
+  --name "hermes-jobs auto-sync" "0 */6 * * *"     # a slow backstop; events do the real work
+```
+
+```yaml
+# config.yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      public_url: "https://<host>.<tailnet>.ts.net"   # any https origin that reaches the listener (:8644)
+mcp_servers:
+  hermes-jobs:
+    command: "/home/<you>/.local/bin/hermes"
+    args: ["hermes-jobs", "mcp-serve"]
+    events: true
+```
+
+Then, in a Hermes chat, ask it to call the hermes-jobs server's `subscribe_event` tool with
+`name: calendar.event_changed`, `arguments: {}` and `deliver: local` (Hermes asks you to approve the
+subscription). That writes a dynamic route `mcp-hermes-jobs-<hash>` to `webhook_subscriptions.json`.
+Point it at the job by adding one key to that route, `"cron_job": "<auto-sync job id>"`
+(`hermes cron list` shows the id), and check it with `hermes webhook list`. Re-running `subscribe_event`
+rewrites the route, so add `cron_job` again if you do. Every event then fires the auto-sync job.
+
+Notes and limits:
+
+- `public_url` must be `https://` (Hermes' client refuses anything else). It does not need to be public.
+  `tailscale serve` on this machine is enough, since the server runs here.
+- Your own `sync --auto` writes come back as one more event; that sync plans nothing, so it stops there.
+- Every Hermes process that connects the server (the gateway, a chat session) runs its own poller.
+  Identical changes carry the same `eventId`, and the gateway dedupes on it.
+- The subscription lives in memory and lasts up to 24h. Hermes refreshes it at 80% and on every
+  reconnect, passing its cursor, so changes made while the gateway was down are replayed as one event.
+
+The fallback, if MCP Events changes: a Google Apps Script installable calendar trigger that signs a
+generic HMAC V2 POST to the same route. Google `events.watch` cannot be used directly, because it
+authenticates only with `X-Goog-Channel-Token`.
 
 ## Setup
 
@@ -93,12 +154,14 @@ hermes hermes-jobs sync       # dry-run by default
 ### What leaves the machine
 
 - **Network**: Google Calendar API v3 on the ONE bound calendar only, via Hermes oauth. Every `sync`
-  (dry-runs too) reads events; only `sync --confirm` writes. Sent: job name, schedule/RRULE, job id,
+  (dry-runs too) reads events; only `sync --confirm` and `sync --auto` (cron-originated ops only) write. Sent: job name, schedule/RRULE, job id,
   prompt sha256 digest, private tags, and once a job has run its last-run time and status word (`ok`,
   `error`, ...) as an event colour + one description line. Never the prompt text, execution config or
   error text.
 - **Reads outside plugin data**: `~/.hermes/cron/jobs.json` and Hermes config (time zone), read-only.
-- **Cron changes**: only through Hermes' `cronjob_manage` tool, only on `--confirm`.
+- **Cron changes**: only through Hermes' `cronjob_manage` tool, only on `--confirm` (never `--auto`).
+- **Push sync only** (opt-in, `mcp-serve`): while subscribed, an incremental Calendar read every 60s, and
+  signed POSTs of event ids/etags/times to this Hermes gateway's own `public_url` webhook route.
 - **Experimental skip only** (off by default): writes `~/.hermes/scripts/hermes-jobs-skip-tick.py` and
   creates two one-shot `no_agent` cron jobs that run `hermes hermes-jobs skip-tick --quiet` (fixed argv,
   no shell). No other background processes; no telemetry; no stored credentials.
@@ -110,7 +173,8 @@ hermes hermes-jobs sync       # dry-run by default
   calendar time can only become a validated schedule. Descriptions are never parsed (the plugin only
   recognises its own `last run:` line, to replace it).
 - No scopes beyond `calendar.events`.
-- No writes without explicit `--confirm`. Discover never creates calendars or cron jobs.
+- No writes without explicit `--confirm`, except `--auto`, which only pushes cron's own state to the
+  calendar and never changes cron. Discover never creates calendars or cron jobs.
 
 ## Sync (0.3.0)
 
@@ -119,6 +183,8 @@ hermes hermes-jobs bind primary          # choose the ONE calendar (local state 
 hermes hermes-jobs sync --offline        # dry-run against an empty calendar, no Google calls
 hermes hermes-jobs sync                  # dry-run against the bound calendar
 hermes hermes-jobs sync --confirm        # apply (human CLI step only; the agent tool can only plan)
+hermes hermes-jobs sync --auto           # guarded: cron->calendar ops only; calendar edits held (see Push sync)
+hermes hermes-jobs mcp-serve             # stdio MCP server: calendar.event_changed events (see Push sync)
 hermes hermes-jobs sync --skip-original=experimental            # dry-run incl. the experimental skip steps
 hermes hermes-jobs skip-tick             # advance pending experimental skips (run by their wake-up jobs)
 hermes hermes-jobs mode [recurring|single]   # show/set event mode (recurring = default; single = fallback)

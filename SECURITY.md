@@ -14,7 +14,8 @@ made through Hermes' `credentialed_provider_request("google", ...)` with the OAu
   Untagged events are read by Google's list call but ignored, except a "this and following" split
   whose id starts with one of our own series ids.
 - **Writes** (only `sync --confirm`, a human CLI step; the agent tool can only plan): insert, patch
-  or delete events on the bound calendar. `capture-fixtures` performs GETs only and writes sanitised
+  or delete events on the bound calendar. `sync --auto` makes only the cron-originated subset of
+  these writes and never changes cron; calendar-originated changes wait for `--confirm`. `capture-fixtures` performs GETs only and writes sanitised
   JSON locally.
 - **Fields sent per event**: title = the cron job **name** (with a `[paused] ` prefix when paused);
   description = the job id, a **sha256 digest (12 hex) of the prompt**, and a fixed note; start/end
@@ -26,6 +27,10 @@ made through Hermes' `credentialed_provider_request("google", ...)` with the OAu
   `last run: <time> <status>` description line, plus the event `colorId` (10 for `ok`, 11 for `error`,
   5 otherwise). Sent by `sync --confirm` as a `mark_run` op that shows in the dry run first. Hermes'
   `last_error` text is never sent, and the title never changes.
+- **Push sync** (opt-in `mcp-serve`, experimental): while Hermes holds a subscription, an incremental
+  events read (`syncToken`) every 60s, and Standard Webhooks-signed POSTs to this Hermes gateway's own
+  `platforms.webhook.extra.public_url` `/webhooks/<route>` (no other URL, no redirects) carrying only
+  changed event ids, etags, status and update times. The signing secret is Hermes'; it is held in memory.
 - **Never sent**: the prompt text, run error text, skills, scripts, tool lists, delivery targets, model settings,
   workdir, or anything else from the job's execution config.
 
