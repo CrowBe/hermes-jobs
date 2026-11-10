@@ -179,7 +179,8 @@ def rebuild(raw_jobs: List[Dict[str, Any]], recs: Dict[str, Any], fp: Callable[[
                         "orig_grace": m.get("grace"), "orig_catch_up": m.get("catch_up"),
                         "fingerprint": fp(raw), "mode": "skip", "status": "pending", "phase": "paused",
                         "rebuilt": True, "wake_ids": [
-                            j["id"] for j in raw_jobs if str(j.get("name", "")).startswith(WAKE_PREFIX + m["k"][:8])]}
+                            j["id"] for j in raw_jobs if str(j.get("name", "")).startswith(WAKE_PREFIX + m["k"][:8])
+                            and j.get("script") == SCRIPT_NAME]}
 
 
 SCRIPT = '''#!/usr/bin/env python3
