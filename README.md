@@ -53,9 +53,11 @@ job like any other, so it appears on the board (one event that moves forward eac
 
 ## Roadmap: push sync
 
-Today, sync is a dry run then `sync --confirm`, or a poll via the auto-sync cron recipe above. Event-driven sync needs no new Hermes code: the gateway webhook platform (`gateway/platforms/webhook.py`, default port 8644) supports a `cron_job` route that fires an existing cron job on each signed POST, so point one at the "hermes-jobs auto-sync" job above.
+Today, sync is a dry run then `sync --confirm`, or a poll via the auto-sync cron recipe above.
 
-Google `events.watch` cannot hit that route directly: it authenticates only with an `X-Goog-Channel-Token` header, and the gateway validates GitHub, GitLab, Svix/Standard Webhooks, Linear, and generic HMAC V2 (`X-Webhook-Signature-V2` + `X-Webhook-Timestamp`). The planned bridge is a Google Apps Script installable calendar trigger on the bound calendar that signs a generic HMAC V2 POST to the gateway route (exposed via e.g. Tailscale Funnel) and needs no watch-channel renewal. An alternative is any MCP server emitting calendar events via MCP Events: Hermes already ships an experimental client (`tools/mcp_tool_events.py`, the `events/*` extension from the MCP Triggers & Events WG), opt-in per server with `mcp_servers.<name>.events: true`, delivered through the same webhook routes (webhook delivery only).
+The planned push path is MCP Events. hermes-jobs will ship a small MCP server that watches the bound calendar (incremental sync token) and emits an event, e.g. `calendar.event_changed`, through the experimental `events/*` extension (`tools/mcp_tool_events.py`, from the MCP Triggers & Events WG). Hermes subscribes with `mcp_servers.<name>.events: true`, and delivery lands on a gateway webhook route (`gateway/platforms/webhook.py`, default port 8644) whose `cron_job` fires the "hermes-jobs auto-sync" job above, so calendar-side edits still wait for a confirm.
+
+Fallback: a Google Apps Script installable calendar trigger on the bound calendar that signs a generic HMAC V2 POST to the same route (e.g. via Tailscale Funnel), because Google `events.watch` authenticates only with `X-Goog-Channel-Token` and cannot satisfy the gateway's GitHub, GitLab, Svix/Standard Webhooks, Linear, or HMAC V2 (`X-Webhook-Signature-V2` + `X-Webhook-Timestamp`) checks.
 
 The guard stays: cron-side changes and run outcome may auto-apply; calendar-side edits still wait for a confirm.
 
