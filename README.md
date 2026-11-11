@@ -10,7 +10,8 @@ Google Calendar is the one supported backend today: the plugin binds to one dedi
 there safely reschedules the real cron job.**
 
 Hermes cron is the system of record. That one Google Calendar is the job board. Every change, in either
-direction, is planned as a dry run first and only applied when you run `--confirm`.
+direction, is planned as a dry run first and only applied when you run `--confirm` (or, for cron's own
+changes only, the guarded `--auto`).
 
 ![hermes-jobs: dry run, --confirm creates the recurring event, re-sync shows 0 ops](docs/demo.gif)
 
@@ -19,8 +20,11 @@ direction, is planned as a dry run first and only applied when you run `--confir
 ```bash
 hermes hermes-jobs discover          # read-only: your cron jobs, oauth status, bound calendar
 hermes hermes-jobs sync              # dry run: the exact ops in both directions, nothing written
-hermes hermes-jobs sync --confirm    # apply that plan
+hermes hermes-jobs sync --confirm    # apply the plan as it stands now
 ```
+
+`--confirm` recalculates the plan at that moment; it does not replay a stored dry run. If anything
+changed in between, it applies the new plan, so re-run the dry run when in doubt.
 
 In a Hermes chat, **`/jobs`** prints the next 7 days of Hermes jobs in agenda order, what is waiting on
 you (pending ops from a dry-run plan, deferred "this and following" changes, unfinished moves), and the
@@ -39,21 +43,28 @@ a job that has never run gets no colour and no line. The error text itself never
 
 ## Auto-sync (opt-in recipe, once you trust the plan)
 
-The plugin never schedules itself and registers no hooks. If you want calendar edits picked up
+The plugin never schedules itself and registers no hooks. If you want the board kept current
 without typing, create your own Hermes `no_agent` cron job with a fixed argv (no LLM, no shell
-expansion of event text):
+expansion of event text). The default recipe runs the guarded `sync --auto`: it pushes cron's own
+changes to the calendar and **holds every calendar edit** for you to review and `--confirm` (see
+[Push sync](#push-sync-experimental-mcp-events) for exactly what is held):
 
 ```bash
 cat > ~/.hermes/scripts/hermes-jobs-sync.sh <<'SH'
 #!/bin/sh
-exec "$HOME/.local/bin/hermes" hermes-jobs sync --confirm   # use your `command -v hermes`
+exec "$HOME/.local/bin/hermes" hermes-jobs sync --auto   # use your `command -v hermes`
 SH
 hermes cron create --no-agent --script hermes-jobs-sync.sh --deliver local \
   --name "hermes-jobs auto-sync" "0 * * * *"
 ```
 
-`--confirm` still refuses a moved occurrence of a recurring job unless you pass `--allow-additional-run` by hand, so the
-recipe never accepts a duplicate run for you; `/jobs` lists it as waiting on you. The sync job itself is
+**Unattended bidirectional variant (pre-approves calendar edits).** Putting `sync --confirm` in that
+script instead means every future calendar-originated change (renames, reschedules, a deleted event
+pausing its job) is applied hourly without anyone reviewing it. Only do that for a calendar you alone
+edit. Even then `--confirm` refuses a moved occurrence of a recurring job unless you pass
+`--allow-additional-run` by hand, so it never accepts a duplicate run for you; `/jobs` lists it as
+waiting on you. Runs never overlap: applying commands hold a per-profile lock, and a second one
+returns "already running" without writing. The sync job itself is
 kept off the board: a `no_agent` job whose script is `hermes-jobs-auto.sh` or `hermes-jobs-sync.sh`, or
 whose script runs `hermes-jobs sync`, never gets an event (a leftover one is deleted). Stop it with
 `hermes cron pause <id>` or `hermes cron remove <id>`.
@@ -183,7 +194,10 @@ hermes hermes-jobs sync       # dry-run by default
   prompt sha256 digest, private tags, and once a job has run its last-run time and status word (`ok`,
   `error`, ...) as an event colour + one description line. Never the prompt text, execution config or
   error text.
-- **Reads outside plugin data**: `~/.hermes/cron/jobs.json` and Hermes config (time zone), read-only.
+- **Reads outside plugin data** (read-only): `~/.hermes/cron/jobs.json`, Hermes config (time zone),
+  and the script file (first 8 KB) of each `no_agent` cron job in `~/.hermes/scripts/`, only to recognise
+  an auto-sync job (one that runs `hermes-jobs sync`) and keep it off the board. Script text is never
+  sent anywhere or executed.
 - **Cron changes**: only through Hermes' `cronjob_manage` tool, only on `--confirm` (never `--auto`).
 - **Push sync only** (opt-in, `mcp-serve`): while subscribed, an incremental Calendar read every 60s, and
   signed POSTs of event ids/etags/times to this Hermes gateway's own `public_url` webhook route.
@@ -201,7 +215,7 @@ hermes hermes-jobs sync       # dry-run by default
 - No writes without explicit `--confirm`, except `--auto`, which only pushes cron's own state to the
   calendar and never changes cron. Discover never creates calendars or cron jobs.
 
-## Sync (0.3.0)
+## Sync (0.3.2)
 
 ```
 hermes hermes-jobs bind primary          # choose the ONE calendar (local state only)
@@ -272,11 +286,13 @@ What each Google edit does on the next sync (dry-run shows it; `--confirm` appli
    events: `--confirm` refuses without `--allow-additional-run` (the original slot ALSO runs), or use
    `--skip-original=experimental`. The series is unchanged. The moved instance itself *is* the copy's
    calendar entry (no extra event, not retagged). Moving it again moves the copy; deleting it pauses the
-   copy (soft pause, as for any deleted event).
+   copy (soft pause, as for any deleted event). An instance edited without changing its time (e.g.
+   retitled) is not a move and plans nothing.
 2. **"All events" (change the series' time or rule)** -> the cron schedule follows **only if** the new
    RRULE converts back cleanly (e.g. 09:00 -> 10:00 gives `0 10 * * *`; daily -> Mon/Wed gives
-   `0 9 * * 1,3`). Otherwise (or if the series' time zone changed) the sync reports it, refuses, and
-   changes nothing. Undo it in Calendar or edit the job in Hermes; cron wins on the next sync.
+   `0 9 * * 1,3`) and the new wall time is DST-safe in the job's zone (e.g. 02:30 Sydney is refused,
+   as in the cron -> RRULE direction). Otherwise (or if the series' time zone changed) the sync reports
+   it, refuses, and changes nothing. Undo it in Calendar or edit the job in Hermes; cron wins on the next sync.
 3. **"This and following"** -> Google ends the old master with `UNTIL` and creates a new series, usually
    with id `<old id>_R<date>`, sometimes without our tags. The plugin treats it as a series reschedule:
    it adopts the new series (`adopt_split`: tags it, makes it the job's event), the cron takes the new
@@ -286,8 +302,11 @@ What each Google edit does on the next sync (dry-run shows it; `--confirm` appli
    otherwise still ignored. If the old series still has runs left (its UNTIL is after the job's next run),
    the cron change is **deferred** (`split_pending`) until the first confirmed sync after the old series
    ends, so the remaining old-rule runs still fire. A split that starts at the original start (only the
-   rule changed) is handled the same way, with an immediate cron change. If the new rule does not convert,
-   nothing is adopted and nothing changes. An `UNTIL` with no follow-on series is reported (cron jobs
+   rule changed) is handled the same way, with an immediate cron change. Cron cannot start on a date, so
+   the new series is adopted only if its first event is exactly where cron would next run after the old
+   series ends; a gap (e.g. the continuation moved to next month) or a changed start date is reported and
+   refused. If the new rule does not convert (including a DST-unsafe time), nothing is adopted and
+   nothing changes. An `UNTIL` with no follow-on series is reported (cron jobs
    cannot end on a date).
 4. **Delete one instance** -> Hermes cannot skip a single run. Without the flag the sync reports `can't
    skip a single run ... nothing changed -- that run WILL still happen` under `info` (informational, not
@@ -431,8 +450,13 @@ hex. The namespace is a fixed literal and must never change. The instant is cano
   never deleted or recreated. Copy links come back from the event tags. A pause caused by deleting
   its event is recognised from Hermes' own `paused_reason` (`hermes-jobs: calendar event deleted`),
   so the deleted event is still not recreated. An armed experimental skip comes back from its pause
-  marker (see below); its wake-up jobs are matched by name AND the installed script, never by name alone. A copy whose create succeeded but whose result was lost is adopted on retry,
-  matched by name + one-shot instant; it is never created twice and never gets its own duplicate event.
+  marker (see below); its wake-up jobs are matched by name AND the installed script, never by name alone. A copy is owned by provenance, never by name: before creating it,
+  the occurrence record journals the ids of any one-shot jobs that already have the copy's name and
+  instant (they are never ours). If the create's result is lost, the retry adopts only the one job that
+  appeared since that journal with exactly the copied execution config; anything ambiguous or different
+  is refused, nothing is created twice, and the copy never gets its own duplicate event. Dropping a move
+  removes only a copy recorded as created by the plugin (`child_owned`); any other job is left in place
+  with a message.
 - **Existing events keep their Google-assigned ids** (the two live probe events). They are adopted
   by tag, and they pick up `hermes_occurrence` on their next patch-forward. Nothing is deleted or
   recreated to migrate them.

@@ -62,7 +62,12 @@ only *pauses* jobs. Untagged events never create jobs.
 
 - Sync state: `<HERMES_HOME>/plugin-data/hermes-jobs/sync-state.json` (via Hermes `PluginState`):
   calendar id, event ids, job hashes, event titles/start times, occurrence records. No prompts, no tokens.
-- Reads (read-only): `<HERMES_HOME>/cron/jobs.json` and Hermes config (time zone).
+- Reads (read-only): `<HERMES_HOME>/cron/jobs.json`, Hermes config (time zone), and the script file
+  (first 8 KB) of each `no_agent` cron job under `<HERMES_HOME>/scripts/`, only to recognise an
+  auto-sync job (its script runs `hermes-jobs sync`) and keep it off the board. Script text is never
+  sent, logged or executed.
+- Lock: `sync.lock` next to the sync state. `sync --confirm`/`--auto`, `mode`, `bind` and `skip-tick`
+  hold it, so two applying runs never overlap.
 - Cron changes go only through Hermes' own `cronjob_manage` tool.
 - `/jobs` (slash command) and the `hermes_jobs_discover` tool are read-only: `/jobs` builds a dry-run
   plan (Google reads only) and writes nothing to Google, cron or sync state.
