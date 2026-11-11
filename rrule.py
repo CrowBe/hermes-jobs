@@ -173,8 +173,24 @@ def until_instant(lines) -> Optional[datetime]:
         return None
 
 
-def rrule_to_cron(lines, start_local: datetime) -> Tuple[Optional[str], Optional[str]]:
-    """Inverse for adoption. ``start_local`` = DTSTART on the event's own wall clock."""
+def next_fire(expr: str, zone: str, after: datetime) -> Optional[datetime]:
+    """First instant strictly after ``after`` at which this (convertible, DST-safe) cron fires in
+    ``zone``. Pure; None if nothing in the next ~2 years."""
+    spec, z = parse_cron(expr), ZoneInfo(zone)
+    d = after.astimezone(z).date()
+    for i in range(800):
+        day = d + timedelta(days=i)
+        if ((spec["mon"] is None or day.month in spec["mon"]) and (spec["dom"] is None or day.day in spec["dom"])
+                and (spec["dow"] is None or (day.weekday() + 1) % 7 in spec["dow"])):
+            at = datetime(day.year, day.month, day.day, spec["hour"], spec["minute"], tzinfo=z)
+            if at > after:
+                return at
+    return None
+
+
+def rrule_to_cron(lines, start_local: datetime, zone: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Inverse for adoption. ``start_local`` = DTSTART on the event's own wall clock. With ``zone``,
+    a time skipped or repeated by DST is refused exactly as in cron_to_rrule."""
     try:
         if start_local is None:
             raise Unconvertible("event has no timed start (all-day events cannot become cron)")
@@ -217,6 +233,8 @@ def rrule_to_cron(lines, start_local: datetime) -> Tuple[Optional[str], Optional
         spec: Spec = {"minute": start_local.minute, "hour": start_local.hour, "dom": dom, "mon": mon, "dow": dow}
         if start_local.second:
             raise Unconvertible("start has seconds")
+        if zone and not dst_safe(start_local.hour, start_local.minute, zone):
+            raise Unconvertible(f"{start_local.hour:02d}:{start_local.minute:02d} falls in a DST transition in {zone}")
         # Round-trip guard: only accept if converting back yields the same rule set.
         expr = format_cron(parse_cron(format_cron(spec)))
         return expr, None

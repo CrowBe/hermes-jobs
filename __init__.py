@@ -10,7 +10,10 @@ profiles, or google-workspace skill tokens (catalog rule 11).
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -202,9 +205,21 @@ def _view(raw: dict) -> dict:
     return j
 
 
-def _crons() -> list:
+def _unskip(raw: dict, recs: Optional[Dict[str, Any]] = None) -> dict:
+    """The job as its owner configured it: an active experimental skip sets catch_up=false itself,
+    and that plugin-owned override must not read as a source edit. Comparisons only."""
+    if raw.get("catch_up") is not False:
+        return raw
+    mark = skip.parse_marker(raw.get("paused_reason")) or {}
+    ours = mark.get("catch_up") is True or any(
+        r.get("mode") == "skip" and r.get("source_job_id") == raw.get("id") and r.get("orig_catch_up") is True
+        and r.get("phase") in skip.ACTIVE_PHASES for r in (recs or {}).values())
+    return {**raw, "catch_up": True} if ours else raw
+
+
+def _crons(recs: Optional[Dict[str, Any]] = None) -> list:
     """Read-only view. No scheduler writes."""
-    return [_view(raw) for raw in _raw_jobs() if not _off_board(raw)]
+    return [_view(_unskip(raw, recs)) for raw in _raw_jobs() if not _off_board(raw)]
 
 
 def _state_file() -> Path:
@@ -227,9 +242,40 @@ def _load_state() -> Dict[str, Any]:
 def _save_state(state: Dict[str, Any]) -> None:
     f = _state_file()
     f.parent.mkdir(parents=True, exist_ok=True)
-    tmp = f.with_suffix(".tmp")
+    tmp = f.with_name(f"{f.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")  # never shared between writers
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
     tmp.replace(f)
+
+
+BUSY = "another hermes-jobs sync is already running for this profile; nothing was written, try again shortly"
+
+
+class Busy(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def _lock(wait: float = 0.0):
+    """Per-profile process lock (flock on a file next to the sync state) around every command
+    that changes state or applies a plan. Raises Busy when another process holds it."""
+    import fcntl
+    import time
+    f = _state_file().with_name("sync.lock")
+    f.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(f, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Busy(BUSY) from None
+                time.sleep(0.5)
+        yield
+    finally:
+        os.close(fd)  # releases the lock
 
 
 def _oauth_status() -> Dict[str, Any]:
@@ -289,12 +335,17 @@ def _mode(st: Dict[str, Any]) -> str:
 def mode(new: Optional[str] = None) -> Dict[str, Any]:
     """Event mode: 'recurring' (default) or 'single' (the hard fallback). Local state only; the
     next confirmed sync converts masters <-> single events (dry-run shows convert_to_* ops)."""
-    st = _load_state()
     if new:
         if new not in {"recurring", "single"}:
             return {"refused": True, "reason": "mode is 'recurring' or 'single'"}
-        st["event_mode"] = new
-        _save_state(st)
+        try:
+            with _lock():
+                st = _load_state()
+                st["event_mode"] = new
+                _save_state(st)
+        except Busy:
+            return {"refused": True, "reason": BUSY}
+    st = _load_state()
     return {"event_mode": _mode(st), "next": "hermes hermes-jobs sync   (dry-run shows the conversion ops)"}
 
 
@@ -325,10 +376,14 @@ def status() -> Dict[str, Any]:
 
 def bind(calendar_id: str) -> Dict[str, Any]:
     """Choose the ONE calendar to sync (local state only). Rebinding forgets prior event links."""
-    st = _load_state()
-    if st.get("calendar_id") != calendar_id:
-        st = {"calendar_id": calendar_id, "jobs": {}, "occurrences": {}}
-        _save_state(st)
+    try:
+        with _lock():
+            st = _load_state()
+            if st.get("calendar_id") != calendar_id:
+                st = {"calendar_id": calendar_id, "jobs": {}, "occurrences": {}}
+                _save_state(st)
+    except Busy:
+        return {"refused": True, "reason": BUSY}
     return {"calendar_id": calendar_id, "state_file": str(_state_file())}
 
 
@@ -343,7 +398,7 @@ def _now():
 def _refresh_occurrences(st: Dict[str, Any], raw_jobs: list) -> Dict[str, Any]:
     """Rebuild armed skips from cron markers; retire copies that have fired or vanished."""
     recs = st.setdefault("occurrences", {})
-    skip.rebuild(raw_jobs, recs, lambda raw: planner.fingerprint(_view(raw)))
+    skip.rebuild(raw_jobs, recs, lambda raw: planner.fingerprint(_view(_unskip(raw, recs))))
     by_id = {r["id"]: r for r in raw_jobs}
     for rec in recs.values():
         if rec.get("status") == "pending" and rec.get("child_id"):
@@ -363,7 +418,7 @@ def _skip_decisions(recs: Dict[str, Any], raw_jobs: list) -> List[Dict[str, Any]
         if rec.get("mode") != "skip":
             continue
         raw = by_id.get(rec.get("source_job_id"))
-        fp = planner.fingerprint(_view(raw)) if raw else None
+        fp = planner.fingerprint(_view(_unskip(raw, recs))) if raw else None
         actions, warnings = skip.decide(rec, raw, fp, _now())
         if actions or warnings:
             out.append({"occurrence": key, "job_id": rec.get("source_job_id"), "actions": actions, "warnings": warnings})
@@ -377,6 +432,19 @@ AUTO_DIRECTIONS = frozenset({"cron->calendar", "state"})
 
 def sync(confirm: bool = False, offline: bool = False, allow_additional_run: bool = False,
          skip_original: Optional[str] = None, auto: bool = False) -> Dict[str, Any]:
+    """Dry runs only read. --confirm/--auto hold the profile lock from planning through apply and
+    snapshot, so two applying runs can never both act on the same plan."""
+    if not (confirm or auto):
+        return _sync(confirm, offline, allow_additional_run, skip_original, auto)
+    try:
+        with _lock():
+            return _sync(confirm, offline, allow_additional_run, skip_original, auto)
+    except Busy:
+        return {"refused": True, "busy": True, "reason": BUSY, "writes": 0}
+
+
+def _sync(confirm: bool, offline: bool, allow_additional_run: bool, skip_original: Optional[str],
+          auto: bool) -> Dict[str, Any]:
     if skip_original not in SKIP_MODES:
         return {"refused": True, "reason": "--skip-original accepts only 'experimental'", "writes": 0}
     if auto and (confirm or allow_additional_run or skip_original):
@@ -387,10 +455,10 @@ def sync(confirm: bool = False, offline: bool = False, allow_additional_run: boo
         return {"refused": True, "reason": "--confirm/--auto need a bound calendar and no --offline", "writes": 0}
     try:
         raw_jobs = _raw_jobs()
-        jobs, events = _crons(), _events(cal, offline)
+        recs = {} if offline else _refresh_occurrences(st, raw_jobs)
+        jobs, events = _crons(recs), _events(cal, offline)
     except Exception as exc:  # noqa: BLE001 -- not signed in, HTTP error, ...
         return {"error": redact(f"{type(exc).__name__}: {exc}")[:400], "sign_in": AUTH_HINT, "writes": 0}
-    recs = {} if offline else _refresh_occurrences(st, raw_jobs)
     decisions = _skip_decisions(recs, raw_jobs)
     ops = board.plan(jobs, events, {} if offline else st.get("jobs", {}), recs, recurring=_mode(st) == "recurring")
     raw_by_id = {r["id"]: r for r in raw_jobs}
@@ -505,7 +573,16 @@ def _reconcile_skips(st: Dict[str, Any], raw_jobs: list, decisions: List[Dict[st
 
 
 def skip_tick(quiet: bool = False) -> Dict[str, Any]:
-    """Run by the wake-up jobs (and safe to run by hand): advance experimental skips. Cron only."""
+    """Run by the wake-up jobs (and safe to run by hand): advance experimental skips. Cron only.
+    Waits up to 2 min for a running sync rather than missing its wake-up."""
+    try:
+        with _lock(wait=120):
+            return _skip_tick(quiet)
+    except Busy:
+        return {"writes": 0, "errors": [BUSY], "warnings": []}
+
+
+def _skip_tick(quiet: bool) -> Dict[str, Any]:
     st = _load_state()
     raw_jobs = _raw_jobs()
     _refresh_occurrences(st, raw_jobs)
@@ -596,7 +673,7 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                 key = op["occurrence"]
                 raw = next(r for r in _raw_jobs() if r["id"] == jid)
                 why = skip.eligibility(raw, op["original_slot"], _now())
-                if why or planner.fingerprint(_view(raw)) != op["fingerprint"]:
+                if why or planner.fingerprint(_view(_unskip(raw, recs))) != op["fingerprint"]:
                     errors.append({"op": op, "error": "experimental skip NOT armed (" + (why or "job changed")
                                    + "); the run WILL happen"})
                     continue
@@ -627,22 +704,30 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                 if a == "create_once":
                     # Journal intent before creating: a crash with unknown result must not duplicate.
                     key = op["occurrence"]
+                    name, at = op["create_args"]["name"], op["moved_start"]
+                    prev = recs.get(key) or {}
+                    # Retrying OUR journaled attempt: only then may a copy it landed be adopted.
+                    retry = (prev.get("status") == "pending" and not prev.get("child_id") and "preexisting" in prev
+                             and planner.instant(prev.get("moved_start")) == planner.instant(at))
+                    # Jobs that already matched before we create are never ours, whatever their name.
+                    before = prev["preexisting"] if retry else sorted(r["id"] for r in _copy_matches(name, at))
                     links.setdefault(jid, {})["move_intent"] = op["event_id"]
                     recs[key] = {"key": key, "source_job_id": jid, "original_slot": op["original_slot"],
                                  "moved_start": op["moved_start"], "event_id": op["event_id"],
                                  "fingerprint": op["fingerprint"], "mode": op.get("mode", "additional"),
                                  "status": "pending", "child_id": None,
                                  "instance_backed": bool(op.get("instance_backed")),
-                                 "instance_event_id": op["event_id"] if op.get("instance_backed") else None}
+                                 "instance_event_id": op["event_id"] if op.get("instance_backed") else None,
+                                 "preexisting": before}
                     _save_state(st)
-                    child = _find_copy(op["create_args"]["name"], op["moved_start"])
-                    if not child:  # adopt a copy an interrupted earlier attempt already created
+                    child = _recover_copy(op["create_args"], before) if retry else None
+                    if not child:
                         result = _check(cron({"action": "create", **op["create_args"]}))
                         writes += 1  # cron creation and event ownership patch are separate writes
                         child = result.get("job_id")
                     if not child:
                         raise RuntimeError("create returned no job_id; reconcile move_intent manually before retry")
-                    recs[key]["child_id"] = child
+                    recs[key].update(child_id=child, child_owned=True)  # created, or provably our landed create
                     if op.get("instance_backed"):
                         # The Google exception IS the copy's board entry: no own event, no retag.
                         links[child] = {"source_job_id": jid, "instance_backed": True,
@@ -652,7 +737,7 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                         if recs[key]["mode"] == "skip":
                             raw = next(r for r in _raw_jobs() if r["id"] == jid)
                             why = skip.eligibility(raw, op["original_slot"], _now())
-                            if why or planner.fingerprint(_view(raw)) != op["fingerprint"]:
+                            if why or planner.fingerprint(_view(_unskip(raw, recs))) != op["fingerprint"]:
                                 recs[key]["mode"] = "additional"
                                 errors.append({"op": op, "error": "experimental skip NOT armed (" + (why or "job changed")
                                                + "); the copy exists and the original slot WILL also run"})
@@ -670,7 +755,7 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                     if recs[key]["mode"] == "skip":
                         raw = next(r for r in _raw_jobs() if r["id"] == jid)
                         why = skip.eligibility(raw, op["original_slot"], _now())
-                        if why or planner.fingerprint(_view(raw)) != op["fingerprint"]:
+                        if why or planner.fingerprint(_view(_unskip(raw, recs))) != op["fingerprint"]:
                             recs[key]["mode"] = "additional"
                             errors.append({"op": op, "error": "experimental skip NOT armed (" + (why or "job changed")
                                            + "); the copy exists and the original slot WILL also run"})
@@ -699,7 +784,11 @@ def _apply(ops: List[Dict[str, Any]], calendar_id: str, st: Optional[Dict[str, A
                     undo = ["restore"] + (["resume"] if src and skip._ours(src, rec["key"]) else []) + ["cleanup", "abort"]
                     skip.execute(cron, _check, rec, src, undo, live)
                 if rec.get("child_id") in live:
-                    _check(cron({"action": "remove", "job_id": rec["child_id"]}))
+                    if rec.get("child_owned"):
+                        _check(cron({"action": "remove", "job_id": rec["child_id"]}))
+                    else:  # never delete a job we cannot prove we created
+                        errors.append({"op": op, "error": f"copy {rec['child_id']} has no provenance record; left in "
+                                       f"place. If it is the moved copy, remove it: hermes cron remove {rec['child_id']}"})
                 if rec.get("event_id") and not rec.get("instance_backed"):
                     gc.delete(rec["event_id"])  # never cancel a series instance; cron-wins re-patches the master
                 rec["status"] = "dropped"
@@ -735,13 +824,33 @@ def _safe_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
     return upd
 
 
-def _find_copy(name: str, moved_start: str) -> Optional[str]:
-    for raw in _raw_jobs():
-        sched = raw.get("schedule") or {}
-        if (raw.get("name") == name and sched.get("kind") == "once"
-                and planner.instant(sched.get("run_at")) == planner.instant(moved_start)):
-            return raw["id"]
-    return None
+def _copy_matches(name: str, moved_start: str) -> List[dict]:
+    """One-shot jobs with a copy's name and instant. Names are display text anyone can set, so a
+    match alone never proves ownership."""
+    return [raw for raw in _raw_jobs() if raw.get("name") == name and (raw.get("schedule") or {}).get("kind") == "once"
+            and planner.instant((raw.get("schedule") or {}).get("run_at")) == planner.instant(moved_start)]
+
+
+def _same_config(raw: dict, create_args: dict) -> bool:
+    want = {k: v for k, v in create_args.items() if k not in {"name", "schedule", "repeat"}}
+    want.setdefault("deliver", "local")
+    try:
+        return _copy_args(raw) == want
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
+def _recover_copy(create_args: dict, preexisting: List[str]) -> Optional[str]:
+    """After an interrupted create of OUR journaled attempt: adopt the one job that appeared since
+    the journal and carries exactly the copied execution config. None = nothing landed, create.
+    Anything ambiguous or unverifiable is refused, never adopted."""
+    new = [r for r in _copy_matches(create_args["name"], create_args["schedule"]) if r["id"] not in preexisting]
+    if not new:
+        return None
+    if len(new) == 1 and _same_config(new[0], create_args):
+        return new[0]["id"]
+    raise RuntimeError(f"{len(new)} new one-shot job(s) match the moved copy's name and time but none is provably "
+                       "ours; nothing adopted or created. Check `hermes cron list`, then re-run")
 
 
 def _check(result) -> dict:
@@ -759,7 +868,8 @@ def _snapshot(calendar_id: str, keep: frozenset = frozenset()) -> None:
     jobs = {j["id"]: j for j in _crons()}
     prev = _load_state()
     old = prev.get("jobs", {})
-    st = {"calendar_id": calendar_id, "jobs": {jid: dict(last) for jid, last in old.items() if jid in jobs},
+    st = {**prev, "calendar_id": calendar_id,  # keeps event_mode and any other local settings
+          "jobs": {jid: dict(last) for jid, last in old.items() if jid in jobs},
           "occurrences": prev.get("occurrences", {})}
     for jid, last in st["jobs"].items():
         if last.get("original_slot") and jobs[jid].get("start") != last["original_slot"]:

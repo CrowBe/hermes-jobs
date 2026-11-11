@@ -32,7 +32,7 @@ class RuntimeTest(unittest.TestCase):
         self.registry_patch = patch.object(M, "_cron_dispatcher", side_effect=lambda: (lambda args: M._CTX["ctx"].dispatch_tool(M.CRON_TOOL, args)))
         self.registry_patch.start()
         self.addCleanup(self.registry_patch.stop)
-        self.patches = [patch.object(M, "_crons", side_effect=lambda: self.jobs),
+        self.patches = [patch.object(M, "_crons", side_effect=lambda *_: self.jobs),
                         patch.object(M, "_raw_jobs", side_effect=lambda: self.raw),
                         patch.object(M, "_events", side_effect=lambda *_: self.events),
                         patch(M.__name__ + ".gcal.Calendar", return_value=self.cal)]
@@ -93,7 +93,7 @@ class RuntimeTest(unittest.TestCase):
         ops = M.planner.plan(self.jobs, [ev(start=T10)], synced())
         self.assertTrue(M._apply(ops, "test-calendar")[1])
         self.raw = [{"id": "landed", "name": ops[0]["create_args"]["name"], "state": "scheduled",
-                     "schedule": {"kind": "once", "run_at": T10}}]
+                     "prompt": "summarise", "schedule": {"kind": "once", "run_at": T10}}]
         self.jobs.append(job(id="landed", name=ops[0]["create_args"]["name"], schedule_kind="once", start=T10))
         self.dispatch.reset_mock()
         retry = M.planner.plan(self.jobs, [ev(start=T10)], M._load_state()["jobs"])

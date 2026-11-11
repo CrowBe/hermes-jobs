@@ -45,14 +45,22 @@ class AllEventsEdgeTest(unittest.TestCase):
         self.assertEqual(acts(ops), ["drop_move", "record"])
         self.assertEqual(ops[0]["child_id"], "c1")
 
-    def test_all_events_to_dst_transition_time_follows_cron_then_master_goes_single(self):
-        # 02:00 Sydney is a documented refusal for cron -> RRULE; the reverse direction accepts it,
-        # so cron follows first and the master is converted to a single event on the next sync.
-        two = "2026-11-07T02:00:00+11:00"
-        ops = B.plan([rjob()], [master(start=two)], rstate())
-        self.assertEqual([(o["action"], o["updates"]) for o in ops], [("update_job", {"schedule": "0 2 * * *"})])
-        j = rjob(schedule="0 2 * * *", cron_expr="0 2 * * *", start=two, rrule=None, rrule_refusal="DST")
-        self.assertEqual(acts(B.plan([j], [master(start=two)], rstate())), ["convert_to_single"])
+    def test_all_events_to_dst_transition_time_is_refused_cron_unchanged(self):
+        # 02:00/02:30 Sydney are skipped on the October transition: refused in BOTH directions now.
+        for two in ("2026-11-07T02:00:00+11:00", "2026-11-07T02:30:00+11:00"):
+            with self.subTest(start=two):
+                ops = B.plan([rjob()], [master(start=two)], rstate())
+                self.assertEqual(acts(ops), ["notice"])
+                self.assertIn("DST transition in Australia/Sydney", ops[0]["reason"])
+
+    def test_reverse_conversion_checks_dst_only_with_a_zone(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        wall = datetime(2026, 10, 4, 2, 30, tzinfo=ZoneInfo("Australia/Sydney"))  # transition morning
+        self.assertEqual(R.rrule_to_cron(["RRULE:FREQ=DAILY"], wall), ("30 2 * * *", None))
+        expr, why = R.rrule_to_cron(["RRULE:FREQ=DAILY"], wall, "Australia/Sydney")
+        self.assertIsNone(expr)
+        self.assertIn("DST", why)
 
     def test_all_day_master_is_refused_not_a_crash(self):
         ops = B.plan([rjob()], [master(start=None)], rstate())
@@ -75,6 +83,13 @@ class ThisEventEdgeTest(unittest.TestCase):
     def test_past_cancelled_instance_is_history(self):
         gone = inst(None, T9, status="cancelled", hermes_job_id=None)
         self.assertEqual(B.plan([rjob(start=T11)], [master(), gone], rstate()), [])
+
+    def test_retitled_instance_at_its_own_time_is_not_a_move(self):
+        renamed = inst(T11, T11, summary="Brief (just this one)")
+        self.assertEqual(B.plan([rjob()], [master(), renamed], rstate()), [])
+        same_instant = inst("2026-11-07T22:00:00+00:00", T11, summary="x")  # same instant, other offset
+        self.assertEqual(B.plan([rjob()], [master(), same_instant], rstate()), [])
+        self.assertEqual(acts(B.plan([rjob()], [master(), inst(MOVED, T11)], rstate())), ["create_once"])
 
     def test_moved_instance_without_timed_start_is_noticed_not_copied(self):
         ops = B.plan([rjob()], [master(), inst(None, T11)], rstate())
@@ -103,6 +118,36 @@ class ThisAndFollowingEdgeTest(unittest.TestCase):
     def test_all_day_split_is_refused_not_a_crash(self):
         ops = B.plan([rjob(start=T11)], [master(recurrence=self.OLD), self._new(start=None)], rstate())
         self.assertEqual(acts(ops), ["notice"])
+
+    def test_split_with_a_gap_or_moved_start_date_is_not_adopted(self):
+        old = master(recurrence=["RRULE:FREQ=DAILY;UNTIL=20261106T125959Z"])  # last run Fri 6 Nov
+        for start in ("2026-12-01T09:00:00+11:00", T11):  # December; Sun 8 Nov skips Sat 7
+            with self.subTest(start=start):
+                ops = B.plan([rjob(start=T11)], [old, self._new(start=start, recurrence=["RRULE:FREQ=DAILY"])],
+                             rstate())
+                self.assertEqual(acts(ops), ["notice"])
+                self.assertIn("series not adopted", ops[0]["reason"])
+                self.assertIn("cron would next run 2026-11-07T09:00:00+11:00", ops[0]["reason"])
+
+    def test_split_continuing_the_next_day_is_adopted(self):
+        old = master(recurrence=["RRULE:FREQ=DAILY;UNTIL=20261106T125959Z"])
+        ops = B.plan([rjob(start=T11)], [old, self._new(start=T9, recurrence=["RRULE:FREQ=DAILY"])], rstate())
+        self.assertEqual(acts(ops), ["adopt_split"])
+
+    def test_split_to_a_dst_transition_time_is_not_adopted(self):
+        old = master(recurrence=["RRULE:FREQ=DAILY;UNTIL=20261106T125959Z"])
+        ops = B.plan([rjob(start=T11)], [old, self._new(start="2026-11-07T02:30:00+11:00",
+                                                        recurrence=["RRULE:FREQ=DAILY"])], rstate())
+        self.assertEqual(acts(ops), ["notice"])
+        self.assertIn("DST transition", ops[0]["reason"])
+
+    def test_next_fire_follows_the_wall_clock(self):
+        from datetime import datetime, timezone
+        after = datetime(2026, 11, 6, 12, 59, 59, tzinfo=timezone.utc)  # 23:59:59 Fri, Sydney
+        self.assertEqual(R.next_fire("0 9 * * 1-5", "Australia/Sydney", after).isoformat(),
+                         "2026-11-09T09:00:00+11:00")
+        self.assertEqual(R.next_fire("0 9 * * *", "Australia/Sydney", after).isoformat(),
+                         "2026-11-07T09:00:00+11:00")
 
     def test_malformed_until_reads_as_no_end(self):
         self.assertIsNone(R.until_instant(["RRULE:FREQ=DAILY;UNTIL=garbage"]))

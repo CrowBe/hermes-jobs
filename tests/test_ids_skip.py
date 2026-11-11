@@ -254,7 +254,8 @@ class SkipRuntimeTest(unittest.TestCase):
         st = M._load_state()
         st["occurrences"] = {key: {"key": key, "source_job_id": "j1", "child_id": "c", "event_id": "e9",
                                    "original_slot": SLOT, "mode": "skip", "phase": "paused", "status": "pending",
-                                   "orig_grace": None, "orig_catch_up": None, "wake_ids": ["w1"]}}
+                                   "orig_grace": None, "orig_catch_up": None, "wake_ids": ["w1"],
+                                   "child_owned": True}}
         M._save_state(st)
         self.raw = [raw(enabled=False, state="paused", paused_reason=S.marker(key, SLOT, None, None)),
                     {"id": "c", "state": "scheduled"}, {"id": "w1", "state": "scheduled"}]

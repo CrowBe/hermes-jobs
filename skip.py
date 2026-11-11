@@ -29,6 +29,7 @@ RESUME_AFTER = timedelta(minutes=10)    # > Hermes' 120 s grace floor with grace
 RESTORE_AFTER = timedelta(minutes=25)   # ticker scans ~every 60 s; leaves room for a slow tick
 MIN_LEAD = timedelta(minutes=5)          # refuse to arm a slot this close (the ticker may win)
 STALE_AFTER = timedelta(hours=2)
+ACTIVE_PHASES = frozenset({"arming", "paused", "resumed"})  # catch_up may be our override in these
 
 
 def _dt(value: str) -> datetime:

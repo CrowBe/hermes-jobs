@@ -196,8 +196,10 @@ class FourCasesTest(unittest.TestCase):
         self.assertFalse({"insert_event", "delete_event", "create_once"} & set(acts(ops)))  # no dup, no orphan
 
     def test_split_after_old_series_ended_updates_cron_now(self):
-        old = master(recurrence=["RRULE:FREQ=DAILY;UNTIL=20261106T125959Z"])
-        ops = B.plan([rjob(start=T11)], [old, self._split(T11)], rstate())
+        old = master(recurrence=["RRULE:FREQ=DAILY;UNTIL=20261108T125959Z"])  # last run Sun 8 Nov
+        later = "2026-11-10T09:00:00+11:00"
+        ops = B.plan([rjob(start=later)], [old, self._split("2026-11-09T09:00:00+11:00")], rstate())
+        self.assertEqual((ops[0]["action"], ops[0]["cron"]), ("adopt_split", "0 9 * * 1,2,3,4,5"))
         self.assertTrue(ops[0]["cron_now"])
 
     def test_split_same_start_rule_only(self):
@@ -208,7 +210,7 @@ class FourCasesTest(unittest.TestCase):
 
     def test_split_tagged_copy_also_detected(self):
         old = master(recurrence=["RRULE:FREQ=DAILY;UNTIL=20261106T125959Z"])
-        new = master(id="othername", start=T11)
+        new = master(id="othername", start=T9)  # continues Sat 7 Nov, the day after the old series ends
         ops = B.plan([rjob(start=T11)], [old, new], rstate())
         self.assertEqual((ops[0]["action"], ops[0]["cron"]), ("adopt_split", None))
 
@@ -321,6 +323,23 @@ class RecurringRuntimeTest(TR.RuntimeTest):
         M._save_state({"calendar_id": "test-calendar", "jobs": rstate()})
         res = M.sync(skip_original="experimental")
         self.assertEqual((acts(res["ops"]), res["ops"][0]["mode"]), (["skip_instance"], "skip"))
+
+    def test_single_mode_survives_a_confirmed_sync(self):
+        M.mode("single")
+        self.jobs = [rjob()]
+        self.events = [master()]
+        M._save_state({**M._load_state(), "jobs": rstate()})
+
+        def patched(event_id, body):  # Google now holds the converted single event
+            self.events = [master(recurrence=None)]
+            return ev()
+        self.cal.patch.side_effect = patched
+        done = M.sync(confirm=True)
+        self.assertEqual((acts(done["ops"]), done["errors"]), (["convert_to_single"], []))
+        self.assertEqual(M._load_state()["event_mode"], "single")  # the snapshot kept it
+        again = M.sync()
+        self.assertEqual(again["event_mode"], "single")
+        self.assertNotIn("convert_to_recurring", acts(again["ops"]))
 
     def test_adopt_split_apply_tags_series_records_history(self):
         op = {"direction": "calendar->cron", "action": "adopt_split", "job_id": "j1", "reason": "x",

@@ -209,12 +209,20 @@ def _plan_job(job, last, cur, series, exceptions, occurrences, recurring) -> Lis
             ops.append(_op("report", "notice", jid, f"split series uses time zone {new.get('tz')}, job uses "
                            f"{job['tz']}; nothing changed"))
             return ops
-        expr, why = rrule.rrule_to_cron(new.get("recurrence"), _wall(new, job["tz"]))
+        expr, why = rrule.rrule_to_cron(new.get("recurrence"), _wall(new, job["tz"]), job["tz"])
+        until = rrule.until_instant(cur.get("recurrence"))
+        if expr:
+            # Cron cannot start on a date: adopt only if cron's first run after the old series ends
+            # IS the new series' first event (no gap, no moved start date).
+            first = rrule.next_fire(expr, job["tz"], until) if until else None
+            if first is None or first.timestamp() != P.instant(new.get("start")):
+                expr, why = None, ("the old series' end is unknown" if until is None else
+                                   f"the new series starts {new.get('start')}, but cron would next run "
+                                   f"{first.isoformat() if first else 'never'} after the old series ends")
         if not expr:
             ops.append(_op("report", "notice", jid, f"'this and following' rule cannot become cron ({why}); "
                            "nothing changed, series not adopted"))
             return ops
-        until = rrule.until_instant(cur.get("recurrence"))
         now = bool(until is None or P.instant(job.get("start")) is None
                    or P.instant(job["start"]) > until.timestamp())
         changes = rrule.canonical_cron(job["cron_expr"]) != expr
@@ -256,7 +264,7 @@ def _plan_job(job, last, cur, series, exceptions, occurrences, recurring) -> Lis
         ops.append(_op("report", "notice", jid, f"series time zone changed to {cur.get('tz')} in Calendar; "
                        f"job uses {job['tz']}; nothing changed"))
     else:
-        expr, why = rrule.rrule_to_cron(cur.get("recurrence"), _wall(cur, job["tz"]))
+        expr, why = rrule.rrule_to_cron(cur.get("recurrence"), _wall(cur, job["tz"]), job["tz"])
         if not expr:
             ops.append(_op("report", "notice", jid, f"Calendar series change cannot be expressed as cron ({why}); "
                            "nothing changed. Undo it in Calendar, or edit the job in Hermes (cron wins)."))
@@ -292,6 +300,8 @@ def _plan_job(job, last, cur, series, exceptions, occurrences, recurring) -> Lis
                                "one-shot copy follows", updates={"schedule": e["start"]}, occurrence=key,
                                moved_start=e["start"]))
             continue
+        if e.get("start") and P.instant(e["start"]) == P.instant(orig):
+            continue  # edited in place (e.g. retitled), not moved: no run to add
         if not e.get("start"):
             ops.append(_op("report", "notice", jid, f"instance {orig} has no timed start (all-day?); ignored"))
         elif not job.get("enabled", True):
